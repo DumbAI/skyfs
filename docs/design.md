@@ -1,6 +1,6 @@
 # skyfs design
 
-Status: proposal, 2026-11-16. Supersedes the filesystem parts of
+Status: implemented (v1), 2026-11-16; open items in §12. Supersedes the filesystem parts of
 [workspace-storage.md](workspace-storage.md) (§4.2, §5.2–5.4, §5.6, §5.10),
 whose object-store comparison (§3) and option survey (§4) still stand.
 The log format is specified in [wal-format.md](wal-format.md); the schema
@@ -22,6 +22,11 @@ the snapshot reflects. The mounted container applies the log to the
 snapshot in the background, at shutdown as far as it can, and the next
 container resumes from the pointer. The log only ever holds the last few
 minutes of changes, so replaying it at mount takes seconds.
+
+A container never holds a long-lived storage key. It holds one credential
+at a time, scoped to its volume's prefix and valid for at most an hour,
+obtained from the platform's workload identity or from the skyfs
+credential broker and refreshed in place (§10.1).
 
 ```
 ┌─────────────────────────── container (or its host) ───────────────────────────┐
@@ -108,9 +113,16 @@ on local disk is a cache of that, rebuildable at any time.
 - **Directory entries**: `(parent, name bytes) → ino`, with a per-directory
   insertion cookie so `readdir` offsets survive concurrent changes
   (`telldir`/`seekdir`).
-- **Extents**: `ino → ordered [file_offset, len) → (object key, object
-  offset, crc32c)`. Holes are absent extents. Overwrites split extents;
-  `CloneRange` shares them (reflink).
+- **Extents**: `ino → ordered [file_offset, len) → (location, chunk,
+  skip)`. Holes are absent extents. Overwrites split extents;
+  `CloneRange` shares them (reflink). The unit of verification is the
+  **chunk**: the bytes of one `Write` (≤ `max_write`, 1 MiB) with the
+  record's CRC32C. A CRC cannot be recomputed for part of an extent after
+  an overwrite splits it, so every piece keeps pointing at its whole chunk
+  plus a `skip`; a reader fetches and verifies the chunk, then serves the
+  slice. The restorer gives repacked extents fresh, exact chunks. A
+  location is either a segment's data region (live store only) or an
+  object key (`blobs/…`, `packs/…`).
 
 **Writer path:** a FUSE request is validated against the current state
 (permissions, existence, `ENOTEMPTY`, `EXDEV`, …). If it fails, an errno is
@@ -244,6 +256,16 @@ reference**: a segment whose records reference a blob is committed only
 after that blob's upload completed. A blob never referenced by a committed
 segment is garbage, removed by GC (§8.3).
 
+The writer tracks a sequential run per inode. The first `inline_data_max`
+bytes of a run go inline; once a run grows past it, later writes append to
+a blob whose key is allocated when it opens, so each `Write` record is
+logged at once, in order, pointing at `BlobRange{key, offset}`; nothing is
+buffered outside the log. A blob closes when the run breaks, the file is
+closed, it reaches `blob_max` (64 MiB), or the segment referencing it
+seals; closing starts its upload, and that segment's PUT waits for it.
+Sealing closes blobs so that replication lag stays bounded by `max-lag`
+plus one blob upload.
+
 ### 6.4 Replication modes (R7)
 
 The mode is chosen per mount (`--replication sync|async`). Both write the
@@ -314,8 +336,8 @@ can within a time budget (§7.4), and only then releases the lease.
 At any moment a volume in blob storage is:
 
 ```
-snapshots/<g>.manifest   ← restore pointer: "state after segment S, op N"
-snapshots/<g>.meta.zst   metadata: inodes, dirents, xattrs, extents
+snapshots/<g>.manifest           ← restore pointer: "state after segment S, op N"
+snapshots/<g>-<blake3>.meta.zst  metadata: inodes, dirents, xattrs, extents
 packs/…, blobs/…         file data the snapshot's extents point at
 wal/<S+1> … wal/<head>   the log tail: changes since the snapshot
 ```
@@ -333,7 +355,12 @@ wal/<S+1> … wal/<head>   the log tail: changes since the snapshot
   holds minutes of changes, not the volume's history.
 - Generations `g` are dense, and each manifest is written once with
   `If-None-Match: *`, so every object except the `volume.json` hint is
-  immutable.
+  immutable. Manifests are never deleted (they are tiny), so existence of
+  generations stays a dense prefix and probing finds the latest.
+- The metadata file is **content-addressed** (its BLAKE3 is in its key and
+  in the manifest). A pass that crashed after uploading it leaves an
+  orphan, never an object a retry must overwrite: overwriting would let a
+  fenced writer replace metadata a newer manifest already points at.
 
 ### 7.2 Restore passes
 
@@ -352,7 +379,8 @@ advances the snapshot from pointer `a` to a committed segment `b`:
    are, never copied. Packs whose live fraction has fallen below 50% are
    rewritten in the same step, which replaces a separate compactor.
 3. **Write metadata.** `VACUUM INTO`, zstd, then PUT
-   `snapshots/<g+1>.meta.zst`.
+   `snapshots/<g+1>-<blake3>.meta.zst` (`If-None-Match: *`; an existing
+   object holds these exact bytes).
 4. **Commit.** PUT `snapshots/<g+1>.manifest` with `If-None-Match: *`.
    **This PUT moves the restore pointer.** Data comes before metadata, and
    metadata before the manifest, so a crash at any step leaves pointer `g`
@@ -394,17 +422,25 @@ a pure function of committed segments.
    hint until `404`. Download the manifest and its metadata (megabytes for
    ~10⁵ files). It seeds both the live store and the restore replica.
 3. Find the log head: `HEAD wal/<seq>` forward from `restored_seq + 1`
-   (galloping, then binary search). No `LIST`.
+   (galloping, then binary search). No `LIST`. Probing finds the *first*
+   missing seq, so a hole in the middle of the log would look like its
+   end, and the next `MountBegin` would fork history into it. The mount
+   fails closed instead if `volume.json` records a later head or any of
+   the next 16 seqs exists.
 4. Check continuity: segment `restored_seq + 1` must carry `prev_digest ==
    restored_digest`. Otherwise the snapshot belongs to another history and
    the mount is refused.
 5. Replay the tail into the live store: one range GET per segment fetches
    its record region only, in parallel, verifying the hash chain. The tail
    is minutes of changes, so this takes seconds.
-6. Commit `MountBegin` (`base_snapshot_gen = g`) and mount. `ls -l`,
+6. Recover this disk's uncommitted segments if they continue the remote
+   log (§6.6): their blobs are uploaded first, then the segments in order.
+7. Commit `MountBegin` (`base_snapshot_gen = g`) and mount. Whether the
+   previous mount ended cleanly comes from the last tail record, or, when
+   the snapshot already covers it, from state that `apply` keeps. `ls -l`,
    `stat`, `find` and `os.walk` are answered locally (R5); no file data has
    been fetched (R4).
-7. The restorer resumes in the background from `restored_seq`. The tail it
+8. The restorer resumes in the background from `restored_seq`. The tail it
    inherited is restored first, re-using the records fetched in step 5.
 
 ### 7.4 Shutdown: drain, then restore best effort
@@ -482,12 +518,17 @@ keeping the tail short and keeping passes cheap pull against each other.
 
 ### 8.1 Read path (R3, R4)
 
-A read maps `[offset, len)` to extents, then each extent to an object
-range. Blocks are served from the local cache or fetched with range GETs
-(4 MiB blocks, 16–64 parallel streams with sequential read-ahead),
-verified against the extent's CRC32C, then cached. The cache key is
-`(object key, block index)`. Objects are immutable, so the cache never
-goes stale and survives remounts. Holes read as zeros without I/O.
+A read maps `[offset, len)` to extents, then each extent to its chunk
+(§5). Chunks come, cheapest first, from the local WAL (uncommitted
+segments and blobs), from committed local files the cache adopted, from
+cached chunks, or by range GET; all of a read's chunks are fetched in
+parallel and the kernel's read-ahead keeps several reads in flight. Every
+chunk is verified against its CRC32C before it is served or cached, from
+any source. The cache key is `(object key, offset, length)`. Objects are
+immutable, so the cache never goes stale and survives remounts. Holes
+read as zeros without I/O. (Coalescing adjacent small chunks into one GET
+and 16–64-stream read-ahead for cold sequential reads are open
+optimizations, measured by the 8 GB model benchmark below.)
 `FOPEN_KEEP_CACHE` keeps the page cache across opens. On Linux 6.9+, a file
 whose data is entirely in the local cache can be opened in FUSE passthrough
 mode.
@@ -497,7 +538,7 @@ The local disk holds three things with different eviction rules:
 | Area | Contents | Eviction |
 |---|---|---|
 | `meta/` | SQLite metadata store | never (derived; rebuilt if lost) |
-| `wal/` | open and uncommitted segments and blobs | **never** until committed. A full disk applies backpressure to writes, then `ENOSPC` |
+| `wal/` | open and uncommitted segments (`<seq>.rec` framed records, `<seq>.dat` data region) and blobs being uploaded | **never** until committed. A full disk returns `ENOSPC` |
 | `cache/` | blocks of committed objects | LRU, with a size limit |
 
 After commit, a local segment or blob file is moved into the cache rather
@@ -520,10 +561,20 @@ packs and rewrite sparse packs (§7.2). The log itself is never rewritten.
   into its tail segments; the next mount starts from a newer snapshot.
   Without retention the log holds only the tail.
 - **Packs and blobs** are deleted when no retained snapshot and no
-  surviving segment references them. Reference sets come from snapshot
-  metadata and segment records. Blobs orphaned by a crash between upload
-  and commit can only be found by `LIST`; GC may list for that, but no
-  correctness path depends on a listing.
+  running mount can reference them, **without LIST**. After each pass the
+  restorer diffs the replica's referenced keys against the previous pass
+  and records newly unreferenced ones in a `garbage(key, gen, time)` table
+  inside the replica, so the record travels with the snapshot. A key
+  becomes deletable once it was dropped before the retention cutoff (every
+  snapshot that referenced it has expired) and at a generation no later
+  than the running mount's base (the base does not reference it). A key
+  referenced again (a pack with identical content) leaves the table. Live
+  extents never reference anything the replica dropped: the replica
+  applies a prefix of the same log, and a dropped key is never referenced
+  again except by content-addressed re-creation, handled above.
+- Blobs orphaned by a crash between upload and commit, and metadata files
+  of crashed passes, are only findable by `LIST`; an offline sweep may
+  list for them. No correctness path depends on a listing.
 
 ## 9. POSIX coverage (R2, R8)
 
@@ -640,6 +691,141 @@ real. Permission checks use the kernel's `default_permissions`, plus ACLs.
 uid/gid are stored numerically; containers with user namespaces see the
 mapped ids.
 
+### 10.1 Authentication and credentials
+
+A container that mounts skyfs needs to read and write its volume in blob
+storage. The usual answer, an access key pair in environment variables,
+is the wrong one: the key never expires, it usually grants the whole
+bucket, it leaks through `docker inspect`, `/proc/<pid>/environ`, child
+processes, crash dumps and image layers, and rotating it means touching
+every deployment.
+
+**Requirements.**
+
+| # | Requirement |
+|---|---|
+| C1 | No long-lived secret in the container, its image or its environment. Whatever is there expires within an hour. |
+| C2 | Least privilege: a credential reaches one volume's prefix only, read-only for read-only mounts. |
+| C3 | One mechanism on every target: AWS (EKS, EC2), GPU clouds without a cloud IAM (Lambda, Hyperstack, DigitalOcean), any Kubernetes, and both S3 and R2. |
+| C4 | Refresh in place: a mount runs for days without remounting. |
+| C5 | Revocable within one credential lifetime, and tied to the single-writer lease (R6). |
+| C6 | Attributable: every credential names its volume and writer. |
+| C7 | Storage access is never on the data path of a third service: a broker outage must not stop reads or writes for at least one credential lifetime. |
+
+**Options.**
+
+| Option | How | For | Against | Verdict |
+|---|---|---|---|---|
+| A. Static keys (env, secret mount) | IAM user / R2 API token per deployment | simplest | fails C1, C4, C5; usually C2 | Rejected; `--allow-static-credentials` for development only |
+| B. Cloud workload identity | EKS IRSA / Pod Identity, ECS task roles, EC2 instance roles: `AssumeRoleWithWebIdentity` by the SDK chain | no secret at all; standard | AWS and S3 only (R2 has no STS federation); scope is per role, not per volume, unless one role per volume | **Supported** (`--credentials ambient`) for AWS-native deployments |
+| C. Credential broker | the container proves its identity to the skyfs control plane, which mints a short-lived, prefix-scoped credential (S3: STS `AssumeRole` with a session policy; R2: temporary access credentials) | meets C1–C7 everywhere; one story for S3 and R2; the broker is also the natural lease holder | a service to run; it holds the parent keys | **Chosen as the default** |
+| D. Presigned URLs | the broker signs each request | the container holds nothing reusable | the broker is on the data path (fails C7); conditional-PUT headers must be signed in; one round trip per object | Rejected |
+| E. Host daemon or sidecar | skyfs runs on the host or a privileged sidecar (§10); the app container gets only the mount | the app never sees any credential | needs a privileged host | **Recommended where available**; the host daemon itself uses B or C |
+| F. External secret agents | Vault Agent, SPIFFE helpers, cloud SDKs render or print credentials | reuse what a platform already runs | one more agent | **Supported** through `--credentials file` and `process` |
+
+**Design.** One interface in `skyfs-store`: a refreshing provider plugged
+into the S3 client as its credential source. It caches one credential,
+fetches the next when less than min(5 min, ¼ of its lifetime) remains,
+and on a failed refresh keeps the current one until it truly expires.
+Every source speaks the AWS `credential_process` JSON format
+(`AccessKeyId`, `SecretAccessKey`, `SessionToken`, `Expiration`), so any
+tool that can produce it plugs in:
+
+| `--credentials` | Source | Typical deployment |
+|---|---|---|
+| `ambient` (default) | the AWS chain: IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE`), EKS Pod Identity / ECS (`AWS_CONTAINER_CREDENTIALS_*`), instance roles. Refuses `AWS_ACCESS_KEY_ID` without `AWS_SESSION_TOKEN` | EKS or EC2 with S3 |
+| `broker` | the skyfs credential broker, authenticated with a workload token | everything else; the default for R2 |
+| `file` | a `credential_process` JSON file an agent keeps fresh (tmpfs, mode 0400) | Vault Agent, a sidecar, a host agent |
+| `process` | a command that prints `credential_process` JSON | site-specific tooling |
+
+**Identity proof.** The broker never sees a long-lived secret from the
+container either. The container presents one of:
+
+- **Kubernetes:** a projected service-account token with audience
+  `skyfs`, expiring in 10 minutes and rotated in place by the kubelet. The
+  broker verifies it against the cluster's OIDC keys and maps
+  `(namespace, service account)` to the volumes it may mount.
+- **Containers started by our orchestrator** (Docker on GPU VMs): a
+  **one-time mount token**, a JWT the control plane signs when it grants
+  the lease: `{volume_id, access, writer_id, lease_id, exp ≤ 10 min, jti}`.
+  It is written to a tmpfs file, never an environment variable, and is
+  accepted for one exchange (`jti`).
+
+Each response may carry a **`RefreshToken`**: single-use, rotated on every
+exchange, bound to the lease, and held only in the daemon's memory. The
+daemon presents it on the next refresh, and falls back to the token file
+if it is refused. A container whose only proof was a one-time token can
+therefore refresh for as long as it holds the lease, and a copied refresh
+token is useless after its first use. A restarted daemon needs a new
+mount token, which the orchestrator issues with the new lease anyway.
+
+**Broker protocol.**
+
+```
+POST {broker}/v1/volumes/{volume_id}/credentials
+Authorization: Bearer <projected SA token | mount token | refresh token>
+{"writer_id": "...", "access": "read-write" | "read-only"}
+
+200 {"Version": 1, "AccessKeyId": "...", "SecretAccessKey": "...",
+     "SessionToken": "...", "Expiration": "<RFC 3339>", "RefreshToken": "..."}
+401 token invalid, expired, reused or revoked
+409 the volume's write lease is held by another writer
+```
+
+**Scoping, per store.** The broker holds the only parent credentials.
+
+- **S3:** `sts:AssumeRole` on a role that may touch only volume prefixes,
+  with `DurationSeconds` ≤ 3600 and a session policy narrowing it to one
+  volume:
+  ```json
+  {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow",
+     "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+     "Resource": "arn:aws:s3:::BUCKET/PREFIX/volumes/VOLUME_ID/*"},
+    {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::BUCKET",
+     "Condition": {"StringLike": {"s3:prefix": "PREFIX/volumes/VOLUME_ID/*"}}}]}
+  ```
+  `s3:ListBucket` on the prefix is required even though skyfs never
+  lists on a correctness path: without it, S3 answers `HEAD` of a
+  missing key with 403 instead of 404, and head probing (§7.3) cannot
+  tell "absent" from "forbidden". Read-only mounts get `GetObject` and
+  `ListBucket` only.
+- **R2:** Cloudflare's temporary access credentials,
+  `POST /accounts/{account}/r2/temp-access-credentials` with
+  `{bucket, parentAccessKeyId, permission: "object-read-write" | "object-read-only",
+  ttlSeconds: 3600, prefixes: ["PREFIX/volumes/VOLUME_ID/"]}`, returning an
+  S3-compatible key triple with a session token.
+
+**Lease coupling (C5, R6).** The broker issues read-write credentials only
+to the current lease holder, and renewing the credential renews the lease.
+Revoking a writer means refusing its next refresh: its credential dies
+within an hour, and until then the in-band fence (§6.5) already prevents
+it from committing anything once a new writer has mounted. Revocation
+never depends on the old container cooperating.
+
+**Inside the container.** Credentials live in the daemon's memory only and
+are never logged (debug output shows the key id). Token files sit on a
+tmpfs readable only by the daemon. When skyfs runs on the host or in a
+sidecar (§10), the app container receives the mount and nothing else.
+
+**Failure behaviour.** A refresh failure keeps the current credential
+until it expires. After that, object requests fail and the existing retry
+loops take over, exactly as when the bucket is unreachable (§11): writes
+continue into the local WAL until `wal/` is full, cached reads keep
+working, and sync-mode durability points wait. A broker outage shorter
+than the credential lifetime is invisible (C7).
+
+**What an attacker gets** by stealing everything in the container: one
+volume's prefix, for at most an hour, and no way to extend it (the refresh
+token is single-use and the mount token already spent). A stolen projected
+service-account token is bound to the `skyfs` audience and expires in
+minutes.
+
+**Implemented here:** the refreshing provider, the four sources, the
+refresh-token rotation and the static-key refusal (`skyfs-store::credentials`),
+and the CLI flags. **Not here:** the broker service and the lease, which
+belong to the control plane; the protocol above is their contract.
+
 ## 11. Guarantees and failure cases
 
 | Event | Result |
@@ -655,27 +841,47 @@ mapped ids.
 | Restorer falls behind (offline, slow uplink) | Still correct: mount replays a longer tail. The tail length is exported as a metric |
 | Snapshot from another history (restored volume, bug) | `prev_digest` of segment `restored_seq + 1` ≠ `restored_digest`; mount refused |
 | Blob storage unreachable | Cached reads work; uncached reads `EIO`; writes continue locally until `wal/` is full, then block; sync-mode durability points block |
+| Credential refresh fails (broker down) | The current credential is used until it expires (≤ 1 h); then as "blob storage unreachable" |
+| A segment deleted from the middle of the log | Mount refused: the head probe would stop at the hole, so it checks the hint and the next 16 seqs (§7.3) |
 
 ## 12. Build order and what settles the open questions
 
+Crates (dependencies point one way):
+`skyfs → skyfs-volume → skyfs-meta, skyfs-store → skyfs-format`.
+The engine lives in `skyfs-volume`, not in the Linux-only binary, so the
+replicator, mount, recovery and restorer are tested on any platform
+against in-memory and local-directory buckets; `skyfs` is the CLI and a
+thin FUSE adapter.
+
 1. `skyfs-format`: log and snapshot-manifest schemas, segment codec. **Done.**
-2. `skyfs-meta`: state machine and `apply`, SQLite store, restore replica
-   and snapshot writer.
-   Property tests: random op sequences applied live vs replayed from
-   encoded segments must give identical state. One scenario test per row
-   of §9.1 (partial write, in-place edit, append, truncate, file and
-   directory rename, replace-by-rename, exchange, hard link, unlink while
-   open), each checked after replay against the expected tree and bytes.
-3. `skyfs-store`: object store client on `object_store` (range GET,
-   conditional PUT, multipart for blobs), key layout (**done**), cache.
-4. `skyfs`: FUSE daemon (`fuser`), replicator, mount and recovery.
-   Linux-only.
-5. Restorer: restore replica, packs, snapshot commit, shutdown restore.
-6. Fault injection: kill at every step of commit, mount, restore pass and
-   shutdown. Check prefix consistency, and that the restore pointer only
-   moves forward and always names a snapshot that loads. Then pjdfstest and
-   the generic xfstests.
-7. GC and log truncation.
+2. `skyfs-meta`: state machine and `apply`, validation (`plan`), SQLite
+   store, snapshot export, fsck. **Done.** Property test: random op
+   sequences applied live vs replayed from encoded segments give identical
+   state, pass fsck, and match a byte-level reference model. One scenario
+   test per row of §9.1, plus snapshot-plus-tail equals full replay.
+3. `skyfs-store`: key layout, object client (create-only PUT, range GET,
+   multipart for blobs), credentials (§10.1), chunk cache. **Done.**
+4. `skyfs-volume`: local WAL, replicator with group commit, blobs, mount,
+   same-disk recovery, fencing. **Done.** End-to-end tests: clean
+   remount elsewhere, blobs read back remotely, same-disk crash recovery,
+   machine loss in async mode, sync-mode acknowledgement, fencing of a
+   stale writer, a broken log refusing the mount.
+5. Restorer: replica, packs, sparse-pack rewrite, snapshot commit,
+   shutdown restore, snapshot expiry, log truncation, LIST-free object GC.
+   **Done.**
+6. `skyfs`: CLI (`create`, `mount`, `fsck`, `info`) and the FUSE adapter.
+   **Done**; smoke-tested through the kernel on Linux (create, blob
+   writes, in-place patch, links, renames, xattrs, unlink-while-open,
+   remount elsewhere, `kill -9` and same-disk recovery, fsck).
+   **pjdfstest passes in full** (238 files, 8,798 tests; `scripts/pjdfstest.sh`,
+   run in CI). The kernel does not enforce `NAME_MAX` for FUSE, so
+   `lookup` returns `ENAMETOOLONG` itself.
+7. **Open:** fault injection at every step of commit, mount, restore and
+   shutdown; the generic xfstests; the
+   credential broker and lease service (control plane); an offline LIST
+   sweep for crash orphans; `atime` updates (mounts behave as `noatime`);
+   FUSE writeback cache and passthrough; POSIX ACL enforcement
+   (`FUSE_POSIX_ACL`; ACL xattrs are stored but not enforced).
 
 Benchmark before step 4 ships:
 

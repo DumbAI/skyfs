@@ -87,7 +87,7 @@ A reader accepts segment `seq` only if all hold; otherwise the mount fails:
 | Key | Content | Mutability |
 |---|---|---|
 | `snapshots/<gen:020>.manifest` | `SnapshotManifest` ([snapshot.proto](../proto/skyfs/snapshot/v1/snapshot.proto)): the restore pointer | immutable, `If-None-Match: *`, written last |
-| `snapshots/<gen:020>.meta.zst` | zstd SQLite metadata at the pointer | immutable |
+| `snapshots/<gen:020>-<blake3>.meta.zst` | zstd SQLite metadata at the pointer, named by the BLAKE3 of its bytes (also in the manifest) | immutable, content-addressed; a crashed pass leaves an orphan, never an object to overwrite |
 | `packs/<blake3 hex>` | inline data repacked by restore | immutable, content-addressed |
 | `blobs/<epoch:016x>/<n:016x>` | large write data | immutable |
 | `volume.json` | hint `{snapshot_gen, head_seq}` | mutable; never trusted for correctness |
@@ -103,5 +103,15 @@ never rewritten.
 - A new optional field is allowed only when a reader that ignores it
   computes the same state. Otherwise it is a new op.
 - An incompatible layout change bumps the magic's version byte.
-- Golden segment fixtures (once `skyfs-meta` lands) pin every op's
-  encoding; changing one is a format change.
+- A golden segment (`crates/skyfs-format/tests/golden.rs`) holds one
+  record of every op with fixed values and pins its bytes by BLAKE3;
+  changing any encoding fails it, and is a format change.
+
+## Replay notes
+
+- Extents of inline writes point at the segment's data region; a reader
+  needs that segment's `records_len` to find the bytes, which it has from
+  replaying the tail. Snapshots never reference segments (§7 of the design).
+- `MountBegin` and `MountEnd` also record, in derived state, whether the
+  latest mount ended cleanly, so a mount whose snapshot already covers the
+  `MountEnd` still knows.

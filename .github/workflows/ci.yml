@@ -20,3 +20,26 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # End-to-end through the kernel: create, mount, every POSIX operation the
+  # design lists, remount elsewhere, SIGKILL and same-disk recovery, fsck.
+  fuse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 attr
+      - run: cargo build -p skyfs
+      - run: sudo env PATH="$PWD/target/debug:$PATH" scripts/fuse-smoke.sh
+
+  # POSIX conformance (design §9): the full pjdfstest suite on a skyfs mount.
+  pjdfstest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 autoconf automake gcc make
+      - run: cargo build -p skyfs
+      - run: sudo env PATH="$PWD/target/debug:$PATH" scripts/pjdfstest.sh

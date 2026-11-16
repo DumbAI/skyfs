@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f30823cc833d686a67da712420a8222d63077a253e0d7822107584067e4cac19 # shrinks to actions = [Mkdir(0, 0)]
+cc aef2087ddab7117a0d271420bf067ca3b1d1dc8c1aecbbb8a722003aceb577a9 # shrinks to actions = [Create(0, 0), Fallocate { file: 0, off: 0, len: 177, mode: 3 }, Fallocate { file: 0, off: 0, len: 1, mode: 5 }]
