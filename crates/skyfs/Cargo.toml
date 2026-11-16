@@ -1,0 +1,31 @@
+[package]
+name = "skyfs"
+version = "0.1.0"
+description = "skyfs daemon and CLI: create, mount (FUSE, Linux), fsck"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "skyfs"
+path = "src/main.rs"
+
+[dependencies]
+skyfs-format.workspace = true
+skyfs-meta.workspace = true
+skyfs-store.workspace = true
+skyfs-volume.workspace = true
+clap.workspace = true
+libc.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = "0.18.0"
+
+[lints]
+workspace = true

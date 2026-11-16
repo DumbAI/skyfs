@@ -18,3 +18,33 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 # Our panics are `expect` on infallible encodes into a Vec.
 missing_panics_doc = "allow"
+
+[workspace.dependencies]
+skyfs-format = { path = "crates/skyfs-format" }
+skyfs-meta = { path = "crates/skyfs-meta" }
+skyfs-store = { path = "crates/skyfs-store" }
+skyfs-volume = { path = "crates/skyfs-volume" }
+
+async-trait = "0.1.89"
+blake3 = "1.8.7"
+bytes = "1.11"
+clap = { version = "4.5", features = ["derive", "env"] }
+crc32c = "0.6.9"
+futures = "0.3.31"
+libc = "0.2.177"
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "fs"] }
+parking_lot = "0.12.4"
+proptest = "1.12"
+prost = "0.14.6"
+rand = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.143"
+tempfile = "3.20"
+thiserror = "2.0.21"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "signal", "process", "net"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+zstd = "0.13.3"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }

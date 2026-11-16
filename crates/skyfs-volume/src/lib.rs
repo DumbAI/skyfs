@@ -1,0 +1,27 @@
+//! The skyfs engine, platform-independent: everything between the FUSE
+//! adapter and the bucket.
+//!
+//! - [`wal`]: the local WAL (open and sealed-but-uncommitted segments).
+//! - [`writer`]: the live store, open segment, blobs and handles, and the
+//!   one path every mutation takes (validate, log, apply).
+//! - `committer`: seals and commits segments in seq order (group commit).
+//! - [`data`]: the verified read path.
+//! - [`mount`]: create, mount, tail replay, same-disk recovery.
+//! - [`restorer`]: restore passes, the restore pointer, GC.
+//! - [`volume`]: the POSIX operations the FUSE layer calls.
+
+mod committer;
+pub mod config;
+pub mod data;
+pub mod error;
+pub mod mount;
+pub mod restorer;
+pub mod snapshot;
+pub mod volume;
+pub mod wal;
+pub mod writer;
+
+pub use config::{CreateOptions, FsyncMode, Replication, VolumeConfig};
+pub use error::VolumeError;
+pub use mount::MountReport;
+pub use volume::{Done, FsStats, UnmountReport, Volume, create_volume};

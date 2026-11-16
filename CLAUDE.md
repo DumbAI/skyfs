@@ -32,6 +32,11 @@ an immutable write-ahead log in blob storage. Read `docs/design.md` and
   identity mismatches (`Remove.ino`, `Rename.replaced_ino`, …) and a
   snapshot whose `restored_digest` does not chain to the log stop the mount. Never
   skip a record.
+- **Never overwrite an immutable object.** Only `volume.json` is PUT
+  without `If-None-Match: *`; snapshot metadata and packs are
+  content-addressed so a retry never needs to overwrite.
+- **Chunks are the unit of verification.** An extent points at a whole
+  written chunk plus a `skip`; every read verifies the chunk's CRC32C.
 
 ## Format rules
 
@@ -44,14 +49,24 @@ an immutable write-ahead log in blob storage. Read `docs/design.md` and
 
 ## Boundaries
 
+- Crates: `skyfs → skyfs-volume → skyfs-meta, skyfs-store → skyfs-format`.
 - `skyfs-format`: on-bucket schemas and codecs, no I/O.
+- `skyfs-meta`: validation (`plan`) and `apply`; no I/O beyond SQLite.
 - `skyfs-store::Key` spells every object key; no other module formats one.
-- FUSE code is Linux-only behind `cfg(target_os = "linux")`. Core crates
-  stay platform-independent and testable on macOS.
-- Credentials come from the environment. Never commit `.env` or keys.
+  `ObjectClient` is the only code that talks to the bucket.
+- `skyfs-volume`: the engine. Platform-independent; its end-to-end tests
+  use in-memory buckets.
+- FUSE code is Linux-only behind `cfg(target_os = "linux")` in `skyfs`,
+  and stays a thin adapter over `skyfs_volume::Volume`.
+- Credentials are short-lived and refreshed (`skyfs-store::credentials`,
+  design §10.1). Never commit `.env` or keys; never log a secret.
 
 ## Commands
 
 ```sh
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
+
+`libc` constants differ in type between macOS and Linux (`mode_t`), so
+check Linux too (Docker command in README, "Develop"); the FUSE smoke test
+is `scripts/fuse-smoke.sh`.

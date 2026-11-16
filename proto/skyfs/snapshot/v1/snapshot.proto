@@ -29,7 +29,7 @@ message SnapshotManifest {
   // The metadata file: zstd-compressed SQLite with inodes, dirents, xattrs
   // and extents. Extents point only at blobs/ and packs/, never at segments,
   // so segments up to restored_seq are not needed to read this state.
-  string meta_key = 8;            // snapshots/<gen:020>.meta.zst
+  string meta_key = 8;            // snapshots/<gen:020>-<meta_blake3 hex>.meta.zst
   uint64 meta_len = 9;
   bytes meta_blake3 = 10;
   uint32 meta_schema_version = 11;

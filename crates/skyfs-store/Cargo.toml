@@ -1,14 +1,29 @@
 [package]
 name = "skyfs-store"
 version = "0.1.0"
-description = "skyfs object layout: the only place that spells an object key"
+description = "skyfs object layout, object store client, credentials and local chunk cache"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-thiserror = "2.0.21"
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+object_store.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
