@@ -873,8 +873,11 @@ thin FUSE adapter.
    **Done**; smoke-tested through the kernel on Linux (create, blob
    writes, in-place patch, links, renames, xattrs, unlink-while-open,
    remount elsewhere, `kill -9` and same-disk recovery, fsck).
+   **pjdfstest passes in full** (238 files, 8,798 tests; `scripts/pjdfstest.sh`,
+   run in CI). The kernel does not enforce `NAME_MAX` for FUSE, so
+   `lookup` returns `ENAMETOOLONG` itself.
 7. **Open:** fault injection at every step of commit, mount, restore and
-   shutdown; pjdfstest and the generic xfstests on a Linux runner; the
+   shutdown; the generic xfstests; the
    credential broker and lease service (control plane); an offline LIST
    sweep for crash orphans; `atime` updates (mounts behave as `noatime`);
    FUSE writeback cache and passthrough; POSIX ACL enforcement

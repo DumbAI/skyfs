@@ -391,3 +391,24 @@ fn unlink_while_open_keeps_data_until_close() {
     assert_eq!(v.getattr(f), Err(Errno::ENOENT));
     v.unmount().unwrap();
 }
+
+#[test]
+fn names_longer_than_name_max_are_too_long() {
+    let b = Bucket::new();
+    let m = tempfile::tempdir().unwrap();
+    let v = b.mount(m.path(), |_| {}).unwrap();
+    let max = "x".repeat(255);
+    write_file(&v, ROOT_INO, &max, b"ok", 2);
+    assert!(v.lookup(ROOT_INO, max.as_bytes()).is_ok());
+    let long = "x".repeat(256);
+    assert_eq!(
+        v.lookup(ROOT_INO, long.as_bytes()),
+        Err(Errno::ENAMETOOLONG)
+    );
+    assert_eq!(
+        v.create(ROOT, ROOT_INO, long.as_bytes(), 0o644, 0)
+            .unwrap_err(),
+        Errno::ENAMETOOLONG
+    );
+    v.unmount().unwrap();
+}

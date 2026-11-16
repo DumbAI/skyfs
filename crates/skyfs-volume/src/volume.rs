@@ -181,6 +181,11 @@ impl Volume {
 
     /// Resolves `name` in `parent`.
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> Result<Attr, Errno> {
+        // The kernel does not enforce NAME_MAX for FUSE; every path
+        // operation starts with a lookup, so this is where it is checked.
+        if name.len() > skyfs_meta::NAME_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
         let st = self.lock();
         let p = Self::attr_of(&st, parent)?;
         if p.kind != Kind::Directory {

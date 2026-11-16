@@ -26,8 +26,9 @@ S3), mounted with FUSE by one writer at a time, on any cloud.
   to its volume's prefix and valid for at most an hour: workload identity
   on AWS, or the skyfs credential broker anywhere else, refreshed in place.
 
-Status: v1 implemented and tested end to end through FUSE on Linux. Open
-items (pjdfstest/xfstests, fault injection, the broker service) are in
+Status: v1 implemented and tested end to end through FUSE on Linux;
+passes the full pjdfstest suite (8,798 tests). Open items (xfstests,
+fault injection, the broker service) are in
 [design §12](docs/design.md#12-build-order-and-what-settles-the-open-questions).
 
 ## Use
