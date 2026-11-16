@@ -1,0 +1,269 @@
+// skyfs write-ahead log, format version 1.
+//
+// This file is the source of truth for the log schema. docs/wal-format.md
+// explains the rules; crates/skyfs-format generates Rust types from it.
+//
+// Evolution rules (enforced in review, see CLAUDE.md):
+//   * Never renumber, reuse or change the type of a field tag.
+//   * A new operation is a new tag in `Record.op`. A reader that meets an
+//     operation it does not know refuses to mount (fail closed): skipping an
+//     operation would silently diverge the filesystem.
+//   * New optional fields are allowed only when an old reader that ignores
+//     them still computes the same filesystem state. Otherwise add a new op.
+//
+// Conventions:
+//   * Inode numbers are u64, allocated by the writer, never reused. ino 1 is
+//     the root directory, created by VolumeCreate.
+//   * Names and symlink targets are raw bytes: POSIX names are byte strings,
+//     not UTF-8. A name never contains '/' or NUL and is never "." or "..".
+//   * Times are nanoseconds since the Unix epoch (UTC), as i64.
+//   * Every record is the result of an operation the writer already validated
+//     and applied. Replaying a record must not fail; if it does, the log or the
+//     replayer is corrupt and the mount is refused.
+
+syntax = "proto3";
+
+package skyfs.wal.v1;
+
+// First message in a segment's record region.
+message SegmentHeader {
+  bytes volume_id = 1;            // 16 bytes, random at volume creation
+  uint64 seq = 2;                 // equals the seq in the object key
+  uint64 epoch = 3;               // epoch of the mount that wrote it
+  bytes prev_digest = 4;          // BLAKE3 of the previous segment's record region; empty for seq 0
+  uint64 first_op_id = 5;
+  uint64 record_count = 6;
+  uint64 snapshot_gen_hint = 7;   // newest snapshot generation known when sealed (hint)
+}
+
+message Record {
+  uint64 op_id = 1;               // strictly increasing across the volume, no gaps
+  int64 time_ns = 2;              // writer clock; sets ctime/mtime where the op implies it
+
+  oneof op {
+    // Lifecycle
+    VolumeCreate volume_create = 10;
+    MountBegin mount_begin = 11;
+    MountEnd mount_end = 12;
+
+    // Namespace
+    Make make = 20;
+    Link link = 21;
+    Remove remove = 22;
+    Rename rename = 23;
+
+    // Data
+    Write write = 30;
+    Fallocate fallocate = 31;
+    CloneRange clone_range = 32;
+
+    // Attributes
+    SetAttr set_attr = 40;
+    SetXattr set_xattr = 41;
+    RemoveXattr remove_xattr = 42;
+
+    // Inode lifetime
+    Reclaim reclaim = 50;
+
+  }
+
+  // 60 and 61 held log-level compaction records in drafts. Data relocation
+  // now happens in snapshots (docs/design.md §7), never in the log.
+  reserved 60, 61;
+  reserved "remap", "checkpoint_written";
+}
+
+// ---------------------------------------------------------------- lifecycle
+
+// Record 0 of segment 0. Creates the root directory (ino 1).
+message VolumeCreate {
+  bytes volume_id = 1;
+  uint32 root_mode = 2;           // permission bits only
+  uint32 root_uid = 3;
+  uint32 root_gid = 4;
+  uint32 inline_data_max = 5;     // largest write stored inside a segment
+}
+
+// First record written by every mount. Committing the segment that holds it
+// claims `epoch`; a stale writer from an older epoch can no longer commit,
+// because its next seq is taken (conditional PUT).
+message MountBegin {
+  uint64 epoch = 1;               // previous epoch + 1
+  bytes writer_id = 2;            // opaque: host, container, process
+  bool previous_clean = 3;        // the log ended with MountEnd
+  uint64 lost_after_op_id = 4;    // if not clean: last op_id seen in the remote log
+  uint64 base_snapshot_gen = 5;   // snapshot this mount bootstrapped from; GC keeps its objects
+}
+
+// Last record of a clean unmount. Every op before it is durable.
+message MountEnd {}
+
+// ---------------------------------------------------------------- namespace
+
+enum FileKind {
+  FILE_KIND_UNSPECIFIED = 0;
+  FILE_KIND_REGULAR = 1;
+  FILE_KIND_DIRECTORY = 2;
+  FILE_KIND_SYMLINK = 3;
+  FILE_KIND_FIFO = 4;
+  FILE_KIND_SOCKET = 5;
+  FILE_KIND_CHAR_DEVICE = 6;
+  FILE_KIND_BLOCK_DEVICE = 7;
+}
+
+// creat / open(O_CREAT) / mkdir / mknod / mkfifo / symlink / bind(AF_UNIX).
+// Creates inode `ino` and the entry (parent, name) -> ino. The parent's mtime
+// and ctime become time_ns.
+message Make {
+  uint64 parent = 1;
+  bytes name = 2;
+  uint64 ino = 3;
+  FileKind kind = 4;
+  uint32 mode = 5;                // permission and set-id/sticky bits, after umask
+  uint32 uid = 6;
+  uint32 gid = 7;                 // already resolved (setgid directories)
+  uint64 rdev = 8;                // device nodes only
+  bytes symlink_target = 9;       // symlinks only
+}
+
+// link(2): adds (new_parent, new_name) -> ino, nlink += 1.
+message Link {
+  uint64 ino = 1;
+  uint64 new_parent = 2;
+  bytes new_name = 3;
+}
+
+// unlink(2) / rmdir(2). Removes the entry; nlink -= 1 (directories: to 0).
+// An inode at nlink 0 stays alive while it is open and is freed by Reclaim.
+message Remove {
+  uint64 parent = 1;
+  bytes name = 2;
+  uint64 ino = 3;                 // expected target, checked on replay
+  bool is_dir = 4;
+}
+
+enum RenameMode {
+  RENAME_MODE_UNSPECIFIED = 0;    // plain rename(2): replaces an existing target
+  RENAME_MODE_NOREPLACE = 1;      // RENAME_NOREPLACE
+  RENAME_MODE_EXCHANGE = 2;       // RENAME_EXCHANGE: swap the two entries
+}
+
+// rename(2) / renameat2(2). Atomic. If the target existed and mode is
+// UNSPECIFIED, the replaced inode loses one link (and is freed by Reclaim
+// once it is closed and at nlink 0).
+message Rename {
+  uint64 old_parent = 1;
+  bytes old_name = 2;
+  uint64 new_parent = 3;
+  bytes new_name = 4;
+  RenameMode mode = 5;
+  uint64 ino = 6;                 // expected source inode
+  uint64 replaced_ino = 7;        // expected target inode, 0 if none (or the swapped inode)
+}
+
+// --------------------------------------------------------------------- data
+
+// Where the bytes of a write or extent live.
+message DataRef {
+  oneof location {
+    // Bytes in this segment's data region.
+    InlineRange inline = 1;
+    // Bytes in a separately uploaded object (`blobs/…`, or `packs/…` in
+    // snapshots), durable before this segment commits.
+    BlobRange blob = 2;
+  }
+}
+
+message InlineRange {
+  uint64 offset = 1;              // from the start of the data region
+  uint64 len = 2;
+}
+
+message BlobRange {
+  string key = 1;                 // object key relative to the volume root
+  uint64 offset = 2;
+  uint64 len = 3;
+}
+
+// write(2) / pwrite / writev / mmap writeback. `offset` is already resolved
+// (O_APPEND). Extends the file if offset + len > size. Sets mtime/ctime and
+// clears set-id bits when the writer did so.
+message Write {
+  uint64 ino = 1;
+  uint64 offset = 2;
+  uint64 len = 3;
+  DataRef data = 4;
+  uint32 crc32c = 5;              // of the written bytes; verified when read
+  bool cleared_setid = 6;
+}
+
+enum FallocateMode {
+  FALLOCATE_MODE_UNSPECIFIED = 0; // allocate; may extend size (posix_fallocate)
+  FALLOCATE_MODE_KEEP_SIZE = 1;
+  FALLOCATE_MODE_PUNCH_HOLE = 2;  // always with KEEP_SIZE
+  FALLOCATE_MODE_ZERO_RANGE = 3;
+  FALLOCATE_MODE_ZERO_RANGE_KEEP_SIZE = 4;
+  FALLOCATE_MODE_COLLAPSE_RANGE = 5;
+  FALLOCATE_MODE_INSERT_RANGE = 6;
+}
+
+message Fallocate {
+  uint64 ino = 1;
+  uint64 offset = 2;
+  uint64 len = 3;
+  FallocateMode mode = 4;
+}
+
+// copy_file_range(2) / FICLONE / FICLONERANGE. Shares extents; no bytes are
+// copied. len 0 with src_offset 0 and dst_offset 0 means the whole file (FICLONE).
+message CloneRange {
+  uint64 src_ino = 1;
+  uint64 src_offset = 2;
+  uint64 dst_ino = 3;
+  uint64 dst_offset = 4;
+  uint64 len = 5;
+}
+
+// --------------------------------------------------------------- attributes
+
+// chmod / chown / truncate / ftruncate / open(O_TRUNC) / utimensat.
+// Only present fields change. ctime becomes time_ns unless `ctime_ns` is set.
+message SetAttr {
+  uint64 ino = 1;
+  optional uint32 mode = 2;       // permission and set-id/sticky bits
+  optional uint32 uid = 3;
+  optional uint32 gid = 4;
+  optional uint64 size = 5;       // truncate: shrinking drops extents, growing adds a hole
+  optional int64 atime_ns = 6;    // utimensat, or a relatime update
+  optional int64 mtime_ns = 7;
+  optional int64 ctime_ns = 8;    // only for replaying an imported tree
+}
+
+enum XattrMode {
+  XATTR_MODE_UNSPECIFIED = 0;     // create or replace
+  XATTR_MODE_CREATE = 1;          // XATTR_CREATE
+  XATTR_MODE_REPLACE = 2;         // XATTR_REPLACE
+}
+
+// setxattr(2), including POSIX ACLs (system.posix_acl_access/default).
+message SetXattr {
+  uint64 ino = 1;
+  bytes name = 2;
+  bytes value = 3;
+  XattrMode mode = 4;
+}
+
+message RemoveXattr {
+  uint64 ino = 1;
+  bytes name = 2;
+}
+
+// ----------------------------------------------------------- inode lifetime
+
+// The last open handle of an inode at nlink 0 was closed: free it and its
+// extents. Inodes still at nlink 0 when a mount ends without Reclaim (they
+// were open at crash time) are freed by replaying the next MountBegin: it
+// frees every inode at nlink 0, as ext4 does with its orphan list.
+message Reclaim {
+  uint64 ino = 1;
+}
