@@ -1,0 +1,37 @@
+# xfstests excluded from scripts/xfstests.sh. Every entry says why; keep
+# the list short. "Open" items are in docs/design.md §12.
+
+# POSIX ACLs are stored but not enforced or inherited (open item:
+# FUSE_POSIX_ACL with default-ACL inheritance at create).
+generic/099
+generic/319
+generic/375
+generic/444
+
+# Clearing S_ISGID on fallocate/punch/zero when the caller is not in the
+# file's group. Without FUSE_HANDLE_KILLPRIV_V2 the kernel applies its
+# older rule (clear S_ISGID only with group-execute) for FUSE; doing it in
+# skyfs needs the caller's supplementary groups, which FUSE does not send.
+generic/683
+generic/684
+generic/685
+
+# File capabilities (security.capability) on FUSE: the test kernel
+# (linuxkit 7.0) answers EINVAL without asking the filesystem. Re-check
+# on other kernels.
+generic/633
+generic/688
+
+# The lock is held and enforced (a second flock blocks), but the test
+# kernel (linuxkit 7.0) does not list FUSE-local flocks in /proc/locks.
+# Re-check on other kernels.
+generic/504
+
+# Mounts one volume twice at once and uses both. skyfs is single-writer
+# (design R6, §6.5): the second mount fences the first, whose writes fail.
+generic/732
+
+# cachestat: expects written pages to stay dirty in the page cache until
+# fsync. skyfs's FUSE mount writes through (no FUSE writeback cache, an
+# open item in docs/design.md §12), so they are never dirty.
+generic/798

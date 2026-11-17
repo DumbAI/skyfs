@@ -20,10 +20,18 @@ use tokio::io::AsyncReadExt;
 use crate::key::{Key, KeyClass, VolumeRoot};
 
 /// Objects up to this size go up in one PUT; larger ones use multipart.
-pub const SINGLE_PUT_MAX: u64 = 16 << 20;
+pub const SINGLE_PUT_MAX: u64 = 8 << 20;
 
-/// Multipart part size. R2 requires all parts but the last to be equal.
-pub const PART_SIZE: usize = 16 << 20;
+/// Multipart part size. R2 requires all parts but the last to be equal;
+/// S3's minimum is 5 MiB.
+pub const PART_SIZE: usize = 8 << 20;
+
+/// Parts of one upload in flight at once. With `blob_uploads` uploads, at
+/// most `blob_uploads × PARTS_IN_FLIGHT × PART_SIZE` bytes are on the wire,
+/// and each request must finish within the request timeout: together they
+/// set the slowest uplink that still makes progress (design §6.3). More
+/// parallelism on a slow link makes every part time out and retry forever.
+pub const PARTS_IN_FLIGHT: usize = 2;
 
 /// Why an object operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -117,18 +125,33 @@ impl ObjectClient {
         }
         let upload = self.store.put_multipart(&self.path(key)).await?;
         let mut writer = WriteMultipart::new_with_chunk_size(upload, PART_SIZE);
+        match Self::send_parts(&mut writer, file).await {
+            Ok(()) => {
+                writer.finish().await?;
+                Ok(())
+            }
+            Err(e) => {
+                // A retry starts a new upload; free this one's stored parts
+                // now rather than leave them to a lifecycle rule.
+                if let Err(abort) = writer.abort().await {
+                    tracing::debug!(error = %abort, "aborting a failed multipart upload");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn send_parts(writer: &mut WriteMultipart, file: &Path) -> Result<(), StoreError> {
         let mut f = tokio::fs::File::open(file).await?;
         let mut buf = vec![0u8; 1 << 20];
         loop {
             let n = f.read(&mut buf).await?;
             if n == 0 {
-                break;
+                return Ok(());
             }
-            writer.wait_for_capacity(8).await?;
+            writer.wait_for_capacity(PARTS_IN_FLIGHT).await?;
             writer.write(&buf[..n]);
         }
-        writer.finish().await?;
-        Ok(())
     }
 
     /// The whole object, or `None` if it does not exist.

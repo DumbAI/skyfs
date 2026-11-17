@@ -7,6 +7,10 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Fault injection for tests of crash and retry paths (`faults`).
+testing = []
+
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true

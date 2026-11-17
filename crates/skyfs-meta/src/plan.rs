@@ -381,6 +381,48 @@ pub fn set_attr(store: &MetaStore, ino: Ino, ch: &AttrChanges, now: i64) -> Resu
     }))
 }
 
+/// How accesses update atime (design §9), chosen per mount.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AtimeMode {
+    /// Linux `relatime`: update when atime is not newer than mtime or
+    /// ctime, or is a day old. At most one record per file per change.
+    #[default]
+    Relatime,
+    /// Never update atime on access (`noatime`).
+    NoAtime,
+    /// Update atime on every access skyfs sees (`strictatime`): one
+    /// record per open for reading, read and listing.
+    Strict,
+}
+
+/// Relatime's refresh interval: an atime older than this is updated even
+/// if the file did not change.
+pub const RELATIME_INTERVAL_NS: i64 = 24 * 3600 * 1_000_000_000;
+
+/// The atime update an access to `a` at `now` logs, if `mode` calls for
+/// one. An access is not a change: the record carries the inode's current
+/// ctime, so applying it moves atime only.
+#[must_use]
+pub fn access(a: &Attr, now: i64, mode: AtimeMode) -> Option<Op> {
+    let due = match mode {
+        AtimeMode::NoAtime => false,
+        AtimeMode::Strict => true,
+        AtimeMode::Relatime => {
+            a.atime_ns <= a.mtime_ns
+                || a.atime_ns <= a.ctime_ns
+                || now.saturating_sub(a.atime_ns) >= RELATIME_INTERVAL_NS
+        }
+    };
+    (due && now > a.atime_ns).then(|| {
+        Op::SetAttr(SetAttr {
+            ino: a.ino,
+            atime_ns: Some(now),
+            ctime_ns: Some(a.ctime_ns),
+            ..SetAttr::default()
+        })
+    })
+}
+
 /// `fallocate(2)`.
 pub fn fallocate(
     store: &MetaStore,
@@ -511,4 +553,54 @@ pub fn kind_of_mode(mode: u32) -> Result<Kind> {
     let kind = Kind::from_mode(mode).ok_or(Errno::EINVAL)?;
     debug_assert_ne!(kind.to_wire(), FileKind::Unspecified);
     Ok(kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attr(atime_ns: i64, mtime_ns: i64, ctime_ns: i64) -> Attr {
+        Attr {
+            ino: 7,
+            kind: Kind::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size: 0,
+            atime_ns,
+            mtime_ns,
+            ctime_ns,
+            rdev: 0,
+        }
+    }
+
+    #[test]
+    fn relatime_follows_linux() {
+        let r = AtimeMode::Relatime;
+        // Not newer than mtime or ctime: due.
+        assert!(access(&attr(10, 10, 5), 20, r).is_some());
+        assert!(access(&attr(10, 5, 10), 20, r).is_some());
+        // Newer than both and fresh: not due.
+        assert!(access(&attr(10, 5, 5), 20, r).is_none());
+        // A day old: due.
+        assert!(access(&attr(10, 5, 5), 10 + RELATIME_INTERVAL_NS, r).is_some());
+        // A clock behind atime never moves it backwards.
+        assert!(access(&attr(10, 10, 10), 9, r).is_none());
+        assert!(access(&attr(10, 10, 10), 20, AtimeMode::NoAtime).is_none());
+        assert!(access(&attr(10, 5, 5), 20, AtimeMode::Strict).is_some());
+        assert!(access(&attr(10, 5, 5), 10, AtimeMode::Strict).is_none());
+    }
+
+    #[test]
+    fn an_access_keeps_ctime() {
+        let Some(Op::SetAttr(s)) = access(&attr(1, 1, 3), 9, AtimeMode::Relatime) else {
+            panic!("due")
+        };
+        assert_eq!((s.ino, s.atime_ns, s.ctime_ns), (7, Some(9), Some(3)));
+        assert_eq!(
+            (s.mode, s.uid, s.gid, s.size, s.mtime_ns),
+            (None, None, None, None, None)
+        );
+    }
 }

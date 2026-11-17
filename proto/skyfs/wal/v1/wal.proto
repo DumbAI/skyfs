@@ -236,7 +236,8 @@ message SetAttr {
   optional uint64 size = 5;       // truncate: shrinking drops extents, growing adds a hole
   optional int64 atime_ns = 6;    // utimensat, or a relatime update
   optional int64 mtime_ns = 7;
-  optional int64 ctime_ns = 8;    // only for replaying an imported tree
+  optional int64 ctime_ns = 8;    // absent: the record time. An atime-only access
+                                  // update carries the unchanged ctime (relatime).
 }
 
 enum XattrMode {

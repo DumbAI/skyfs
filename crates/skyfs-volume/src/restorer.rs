@@ -10,14 +10,18 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures::StreamExt;
+use skyfs_format::snapshot::v1::SnapshotManifest;
 use skyfs_format::wal::v1::Record;
 use skyfs_meta::{Ino, MetaStore, Relocation};
 use skyfs_store::{Key, hex};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::data::ReadError;
 use crate::error::VolumeError;
 use crate::snapshot::{self, Hint, SnapshotId, now_ns};
 use crate::wal::Sealed;
@@ -87,6 +91,9 @@ pub struct Base {
     pub created_ns: i64,
 }
 
+/// Chunk reads in flight while repacking.
+const REPACK_READS: usize = 16;
+
 /// The background restorer.
 pub struct Restorer {
     shared: Arc<Shared>,
@@ -98,6 +105,10 @@ pub struct Restorer {
     oldest: Option<Instant>,
     /// Applied to the replica but not yet in a published snapshot.
     unpublished: bool,
+    /// A manifest whose PUT failed: it may have landed with its response
+    /// lost, so it is retried byte for byte before anything else changes
+    /// the replica.
+    inflight: Option<SnapshotManifest>,
     refs: BTreeSet<String>,
     retained: VecDeque<Retained>,
     retained_loaded: bool,
@@ -134,6 +145,7 @@ impl Restorer {
             pending_bytes: 0,
             oldest: None,
             unpublished: false,
+            inflight: None,
             refs,
             retained: VecDeque::new(),
             retained_loaded: false,
@@ -178,7 +190,12 @@ impl Restorer {
     /// Runs until the channel closes.
     pub async fn run(mut self, mut rx: mpsc::UnboundedReceiver<RestoreMsg>) {
         loop {
-            let wake = self.next_wake();
+            // A backlog larger than one pass continues at once.
+            let wake = if self.due() && !self.stopped {
+                Some(Instant::now())
+            } else {
+                self.next_wake()
+            };
             let msg = tokio::select! {
                 m = rx.recv() => match m {
                     Some(m) => Some(m),
@@ -205,17 +222,27 @@ impl Restorer {
         }
     }
 
+    /// Stops for good on errors no retry can fix: another writer owns the
+    /// volume, or the replica cannot follow the log. Returns whether it
+    /// stopped.
+    fn stop_if_fatal(&mut self, e: &VolumeError) -> bool {
+        match e {
+            VolumeError::Fenced(why) => {
+                tracing::error!(why, "restorer stopped: another writer owns the volume");
+            }
+            VolumeError::Apply(_) | VolumeError::Corrupt(_) => {
+                tracing::error!(error = %e, "restorer stopped: the replica cannot follow the log");
+            }
+            _ => return false,
+        }
+        self.stopped = true;
+        true
+    }
+
     async fn attempt(&mut self) {
         match self.pass().await {
             Ok(()) => self.retry_at = None,
-            Err(VolumeError::Fenced(why)) => {
-                tracing::error!(why, "restorer stopped: another writer owns the volume");
-                self.stopped = true;
-            }
-            Err(e @ (VolumeError::Apply(_) | VolumeError::Corrupt(_))) => {
-                tracing::error!(error = %e, "restorer stopped: the replica cannot follow the log");
-                self.stopped = true;
-            }
+            Err(e) if self.stop_if_fatal(&e) => {}
             Err(e) => {
                 tracing::warn!(error = %e, "restore pass failed; will retry");
                 self.retry_at = Some(Instant::now() + Duration::from_secs(10));
@@ -223,17 +250,23 @@ impl Restorer {
         }
     }
 
+    /// Restores until the pointer reaches everything received, or
+    /// `deadline`. Transient bucket errors are retried with backoff while
+    /// time remains.
     async fn drain(&mut self, deadline: Instant) -> bool {
+        let mut backoff = Duration::from_millis(50);
         while !self.stopped && (!self.pending.is_empty() || self.unpublished) {
             let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            if left.is_zero() || self.shared.abort.load(Ordering::Relaxed) {
                 return false;
             }
             match tokio::time::timeout(left, self.pass()).await {
                 Ok(Ok(())) => {}
+                Ok(Err(e)) if self.stop_if_fatal(&e) => return false,
                 Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "restore at unmount failed");
-                    return false;
+                    tracing::warn!(error = %e, "restore at unmount failed; retrying");
+                    tokio::time::sleep(backoff.min(left)).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(2));
                 }
                 Err(_) => return false,
             }
@@ -243,17 +276,38 @@ impl Restorer {
 
     /// One pass: apply, repack, publish, collect.
     async fn pass(&mut self) -> Result<(), VolumeError> {
-        while let Some(seg) = self.pending.pop_front() {
-            for r in seg.records.iter() {
-                self.replica.lock().apply(r, seg.seq)?;
-            }
-            self.replica
-                .lock()
-                .finish_segment(seg.seq, &seg.digest, seg.epoch)?;
-            self.unpublished = true;
+        if let Some(m) = self.inflight.clone() {
+            self.commit(m).await?;
         }
-        self.pending_bytes = 0;
-        self.oldest = None;
+        // At most one batch per pass: a long backlog (a tail replayed at
+        // mount, a slow uplink) then advances the pointer in published
+        // steps, so a mount that ends early still keeps its progress.
+        //
+        // Cancel-safe: a segment leaves the queue only once applied, and
+        // the yield between segments lets the shutdown deadline stop the
+        // pass there; the next pass publishes what was applied.
+        let mut n = 0;
+        while n < self.shared.cfg.restore_batch {
+            let Some(seg) = self.pending.front() else {
+                break;
+            };
+            {
+                let mut replica = self.replica.lock();
+                for r in seg.records.iter() {
+                    replica.apply(r, seg.seq)?;
+                }
+                replica.finish_segment(seg.seq, &seg.digest, seg.epoch)?;
+            }
+            let seg = self.pending.pop_front().expect("peeked");
+            self.pending_bytes = self.pending_bytes.saturating_sub(seg.record_bytes);
+            self.unpublished = true;
+            n += 1;
+            tokio::task::yield_now().await;
+        }
+        if self.pending.is_empty() {
+            self.pending_bytes = 0;
+            self.oldest = None;
+        }
         if !self.unpublished {
             return Ok(());
         }
@@ -262,7 +316,7 @@ impl Restorer {
         let next = self.generation + 1;
         let shared = self.shared.clone();
         let exported = snapshot::export(&self.replica.lock(), &shared.scratch, next)?;
-        let published = snapshot::publish(
+        let m = snapshot::upload_meta(
             &shared.client,
             exported,
             SnapshotId {
@@ -273,33 +327,44 @@ impl Restorer {
             },
         )
         .await?;
-        let Some(m) = published else {
+        self.commit(m).await
+    }
+
+    /// Commits the manifest of the replica's current state (the restore
+    /// pointer moves), then tracks garbage and collects.
+    async fn commit(&mut self, m: SnapshotManifest) -> Result<(), VolumeError> {
+        let shared = self.shared.clone();
+        self.inflight = Some(m.clone());
+        if !snapshot::commit_manifest(&shared.client, &m).await? {
+            self.inflight = None;
             return Err(VolumeError::Fenced(format!(
-                "snapshot {next} already exists"
+                "snapshot {} already exists",
+                m.r#gen
             )));
-        };
-        self.generation = next;
+        }
+        self.inflight = None;
+        self.generation = m.r#gen;
         self.unpublished = false;
         tracing::info!(
-            generation = next,
+            generation = m.r#gen,
             restored_seq = m.restored_seq,
             "restore pointer moved"
         );
         snapshot::write_hint(
             &shared.client,
             Hint {
-                snapshot_gen: next,
+                snapshot_gen: m.r#gen,
                 head_seq: m.restored_seq,
             },
         )
         .await;
         self.retained.push_back(Retained {
-            generation: next,
+            generation: m.r#gen,
             created_ns: m.created_ns,
             restored_seq: m.restored_seq,
             meta_key: m.meta_key.clone(),
         });
-        self.track_garbage(next, m.created_ns)?;
+        self.track_garbage(m.r#gen, m.created_ns)?;
         if let Err(e) = self.collect().await {
             tracing::warn!(error = %e, "garbage collection failed; will retry after the next pass");
         }
@@ -320,13 +385,23 @@ impl Restorer {
         };
         let mut buf: Vec<u8> = Vec::new();
         let mut moves: Vec<Relocation> = Vec::new();
-        for (ino, e) in todo {
-            let bytes = self
-                .shared
-                .data
-                .extent(&e)
-                .await
-                .map_err(|err| VolumeError::Corrupt(err.to_string()))?;
+        let shared = self.shared.clone();
+        let mut reads = futures::stream::iter(todo)
+            .map(|(ino, e)| {
+                let shared = shared.clone();
+                async move {
+                    let bytes = shared.data.extent(&e).await;
+                    (ino, e, bytes)
+                }
+            })
+            .buffered(REPACK_READS);
+        while let Some((ino, e, bytes)) = reads.next().await {
+            let bytes = bytes.map_err(|err| match err {
+                // Unreachable bucket: retry later. Anything else is bytes
+                // that fail verification.
+                ReadError::Store(s) => VolumeError::Store(s),
+                other => VolumeError::Corrupt(other.to_string()),
+            })?;
             moves.push(Relocation {
                 ino,
                 off: e.off,

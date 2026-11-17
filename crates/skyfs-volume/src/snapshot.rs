@@ -171,6 +171,16 @@ pub async fn publish(
     exported: Exported,
     id: SnapshotId<'_>,
 ) -> Result<Option<SnapshotManifest>, VolumeError> {
+    let m = upload_meta(client, exported, id).await?;
+    Ok(commit_manifest(client, &m).await?.then_some(m))
+}
+
+/// Uploads a snapshot's metadata and returns the manifest that commits it.
+pub async fn upload_meta(
+    client: &ObjectClient,
+    exported: Exported,
+    id: SnapshotId<'_>,
+) -> Result<SnapshotManifest, VolumeError> {
     let Exported {
         compressed,
         pos,
@@ -185,8 +195,7 @@ pub async fn publish(
     // Content-addressed: an existing object is these exact bytes.
     let meta_len = compressed.len() as u64;
     client.put_new(&meta_key, Bytes::from(compressed)).await?;
-
-    let manifest = SnapshotManifest {
+    Ok(SnapshotManifest {
         volume_id: id.volume_id.to_vec(),
         r#gen: id.generation,
         parent_gen: id.parent_gen,
@@ -202,17 +211,23 @@ pub async fn publish(
         data_bytes: stats.data_bytes,
         created_ns: now_ns(),
         restorer_id: id.restorer_id.as_bytes().to_vec(),
-    };
-    match client
-        .put_new(
-            &Key::SnapshotManifest(id.generation),
-            Bytes::from(manifest.encode_to_vec()),
-        )
-        .await?
-    {
-        Created::New => Ok(Some(manifest)),
-        Created::AlreadyExists => Ok(None),
-    }
+    })
+}
+
+/// PUTs a manifest, moving the restore pointer. `Ok(false)`: another
+/// manifest holds this generation. An existing manifest with exactly these
+/// bytes is this caller's own earlier attempt whose response was lost, so
+/// a caller retrying after an error must retry the same manifest.
+pub async fn commit_manifest(
+    client: &ObjectClient,
+    m: &SnapshotManifest,
+) -> Result<bool, VolumeError> {
+    let key = Key::SnapshotManifest(m.r#gen);
+    let bytes = Bytes::from(m.encode_to_vec());
+    Ok(match client.put_new(&key, bytes.clone()).await? {
+        Created::New => true,
+        Created::AlreadyExists => client.get(&key).await?.as_ref() == Some(&bytes),
+    })
 }
 
 /// Wall clock in ns since the epoch.

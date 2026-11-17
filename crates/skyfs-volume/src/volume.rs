@@ -5,8 +5,7 @@
 //! the caller may be told it succeeded, when the replication mode demands
 //! it (design §6.4); the FUSE layer waits off its dispatch thread.
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use skyfs_format::wal::v1::{FallocateMode, MountEnd, RenameMode, XattrMode, record::Op};
@@ -40,6 +39,12 @@ impl<T> Done<T> {
     }
 }
 
+/// The capacity a volume reports. Blob storage has no fixed size, but
+/// `statfs` must answer something and `fallocate` must agree with it.
+pub const CAPACITY_BYTES: u64 = 1 << 52;
+/// The inode count a volume reports.
+pub const CAPACITY_INODES: u64 = 1 << 40;
+
 /// Filesystem totals for `statfs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsStats {
@@ -47,6 +52,18 @@ pub struct FsStats {
     pub inodes: u64,
     /// Logical bytes stored.
     pub bytes: u64,
+    /// Reported capacity ([`CAPACITY_BYTES`]).
+    pub capacity: u64,
+    /// Reported inode capacity ([`CAPACITY_INODES`]).
+    pub max_inodes: u64,
+}
+
+impl FsStats {
+    /// Bytes reported free.
+    #[must_use]
+    pub fn free(&self) -> u64 {
+        self.capacity.saturating_sub(self.bytes)
+    }
 }
 
 /// What happened at unmount.
@@ -56,6 +73,22 @@ pub struct UnmountReport {
     pub head_seq: u64,
     /// The restore pointer reached the head before the timeout.
     pub fully_restored: bool,
+}
+
+/// Abandons a mount from another thread (see [`Volume::abort_handle`]).
+#[derive(Debug, Clone)]
+pub struct AbortHandle(Weak<Shared>);
+
+impl AbortHandle {
+    /// Abandons the mount, if it is still alive: waiters and mutations
+    /// fail with EIO, and a blocked [`Volume::unmount`] returns
+    /// [`VolumeError::Aborted`]. Committed state is untouched; the local
+    /// WAL is recovered by the next mount on this disk, as after a crash.
+    pub fn abort(&self) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.abort();
+        }
+    }
 }
 
 /// A mounted volume.
@@ -103,25 +136,42 @@ impl Volume {
         let handle = rt.handle().clone();
         let m = rt.block_on(mount::mount(client, volume_id, cfg, handle))?;
         let (stop, stop_rx) = watch::channel(false);
-        let committer = rt.spawn(committer::run(m.shared.clone(), stop_rx));
+        let read_only = m.shared.cfg.read_only;
+        let committer = (!read_only).then(|| rt.spawn(committer::run(m.shared.clone(), stop_rx)));
         let restorer = m
-            .shared
-            .cfg
             .restorer
-            .then(|| rt.spawn(m.restorer.run(m.restore_rx)));
+            .filter(|_| m.shared.cfg.restorer)
+            .map(|r| rt.spawn(r.run(m.restore_rx)));
         let vol = Self {
             shared: m.shared,
             rt: Some(rt),
             stop,
-            committer: Some(committer),
+            committer,
             restorer,
             report: m.report,
         };
+        if read_only {
+            return Ok(vol);
+        }
         // MountBegin claims the epoch: it must land before we serve.
+        // If the bucket stays unreachable, give up (dropping `vol` abandons
+        // the mount; the next mount on this disk sets the segment aside).
         let seq = vol.shared.state.lock().last_seq.unwrap_or(0);
-        vol.wait(seq)
-            .map_err(|_| VolumeError::Fenced("MountBegin could not be committed".into()))?;
-        Ok(vol)
+        let limit = vol.shared.cfg.mount_timeout;
+        let shared = vol.shared.clone();
+        let landed = vol
+            .shared
+            .rt
+            .block_on(async move { tokio::time::timeout(limit, shared.wait_committed(seq)).await });
+        match landed {
+            Ok(Ok(())) => Ok(vol),
+            Ok(Err(_)) => Err(VolumeError::Fenced(
+                "MountBegin could not be committed".into(),
+            )),
+            Err(_) => Err(VolumeError::Timeout(format!(
+                "MountBegin was not committed within {limit:?}"
+            ))),
+        }
     }
 
     /// What mount found.
@@ -158,6 +208,14 @@ impl Volume {
         async move { shared.wait_committed(seq).await }
     }
 
+    /// A handle that abandons this mount from another thread, e.g. on a
+    /// second signal while an unmount waits for an unreachable bucket. It
+    /// does not keep the volume alive.
+    #[must_use]
+    pub fn abort_handle(&self) -> AbortHandle {
+        AbortHandle(Arc::downgrade(&self.shared))
+    }
+
     /// The commit state: highest committed seq, fenced.
     #[must_use]
     pub fn commit_state(&self) -> crate::writer::CommitState {
@@ -177,6 +235,20 @@ impl Volume {
         st.meta.getattr(ino).map_err(meta_err)?.ok_or(Errno::ENOENT)
     }
 
+    /// Logs the atime update an access to `a` calls for (design §9). It
+    /// rides in the open segment with whatever comes next and nobody waits
+    /// for it; an access never fails because its atime could not be logged
+    /// (fenced, unmounting, local disk full). Returns whether atime moved.
+    fn accessed(&self, st: &mut State, a: &Attr) -> bool {
+        if self.shared.check_writable(st).is_err() {
+            return false;
+        }
+        match plan::access(a, snapshot::now_ns(), self.shared.cfg.atime) {
+            Some(op) => self.shared.log_op(st, op).is_ok(),
+            None => false,
+        }
+    }
+
     // ------------------------------------------------------------ queries
 
     /// Resolves `name` in `parent`.
@@ -188,6 +260,12 @@ impl Volume {
         }
         let st = self.lock();
         let p = Self::attr_of(&st, parent)?;
+        // `.` of any inode is the inode: the kernel revives a file handle
+        // with `lookup(ino, ".")`. An unlinked, closed inode is gone (ESTALE
+        // to the caller); one still open is found.
+        if name == b"." {
+            return Ok(p);
+        }
         if p.kind != Kind::Directory {
             return Err(Errno::ENOTDIR);
         }
@@ -214,33 +292,40 @@ impl Volume {
 
     /// Target of symlink `ino`.
     pub fn readlink(&self, ino: Ino) -> Result<Vec<u8>, Errno> {
-        let st = self.lock();
-        if Self::attr_of(&st, ino)?.kind != Kind::Symlink {
+        let mut st = self.lock();
+        let a = Self::attr_of(&st, ino)?;
+        if a.kind != Kind::Symlink {
             return Err(Errno::EINVAL);
         }
-        st.meta
+        let target = st
+            .meta
             .readlink(ino)
             .map_err(meta_err)?
-            .ok_or(Errno::EINVAL)
+            .ok_or(Errno::EINVAL)?;
+        self.accessed(&mut st, &a);
+        Ok(target)
     }
 
     /// Entries of `dir` after cookie `after` (`.`/`..` not included), and
-    /// the parent for `..`.
+    /// the parent for `..`. A listing from the start (`after` ≤ 2, the
+    /// cookies of `.` and `..`) is an access for atime.
     pub fn readdir(
         &self,
         dir: Ino,
         after: u64,
         limit: usize,
     ) -> Result<(Vec<DirEntry>, Ino), Errno> {
-        let st = self.lock();
-        if Self::attr_of(&st, dir)?.kind != Kind::Directory {
+        let mut st = self.lock();
+        let a = Self::attr_of(&st, dir)?;
+        if a.kind != Kind::Directory {
             return Err(Errno::ENOTDIR);
         }
         let parent = st.meta.parent(dir).map_err(meta_err)?.unwrap_or(ROOT_INO);
-        Ok((
-            st.meta.readdir(dir, after, limit).map_err(meta_err)?,
-            parent,
-        ))
+        let entries = st.meta.readdir(dir, after, limit).map_err(meta_err)?;
+        if after <= 2 {
+            self.accessed(&mut st, &a);
+        }
+        Ok((entries, parent))
     }
 
     /// Value of xattr `name`.
@@ -266,6 +351,8 @@ impl Volume {
         Ok(FsStats {
             inodes: s.inodes,
             bytes: s.data_bytes,
+            capacity: CAPACITY_BYTES,
+            max_inodes: CAPACITY_INODES,
         })
     }
 
@@ -273,13 +360,14 @@ impl Volume {
     /// fetched in parallel and verified.
     pub fn read(&self, ino: Ino, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
         let (end, extents) = {
-            let st = self.lock();
+            let mut st = self.lock();
             let a = Self::attr_of(&st, ino)?;
             match a.kind {
                 Kind::Regular => {}
                 Kind::Directory => return Err(Errno::EISDIR),
                 _ => return Err(Errno::EINVAL),
             }
+            self.accessed(&mut st, &a);
             let end = offset.saturating_add(u64::from(size)).min(a.size);
             if offset >= end {
                 return Ok(Vec::new());
@@ -471,6 +559,16 @@ impl Volume {
         Ok(self.shared.open_handle(&mut st, ino))
     }
 
+    /// An open for reading is an access: the kernel serves reads from its
+    /// page cache without asking skyfs, so the open is where a read is
+    /// sure to be seen. Returns whether atime moved (the kernel's cached
+    /// attributes are then stale).
+    pub fn access(&self, ino: Ino) -> Result<bool, Errno> {
+        let mut st = self.lock();
+        let a = Self::attr_of(&st, ino)?;
+        Ok(a.kind == Kind::Regular && self.accessed(&mut st, &a))
+    }
+
     /// The inode behind handle `fh`.
     pub fn handle_ino(&self, fh: u64) -> Result<Ino, Errno> {
         Ok(self.lock().handle(fh)?.ino)
@@ -504,6 +602,16 @@ impl Volume {
     ) -> Result<Done<()>, Errno> {
         let mut st = self.lock();
         self.shared.check_writable(&st)?;
+        // A reservation beyond the free space `statfs` reports cannot be
+        // honoured, as on any filesystem.
+        let reserves = matches!(
+            mode,
+            FallocateMode::Unspecified | FallocateMode::KeepSize | FallocateMode::InsertRange
+        );
+        let used = st.meta.stats().map_err(meta_err)?.data_bytes;
+        if reserves && len > CAPACITY_BYTES.saturating_sub(used) {
+            return Err(Errno::ENOSPC);
+        }
         let op = plan::fallocate(&st.meta, ino, offset, len, mode)?;
         self.shared.end_run(&mut st, ino);
         let seq = self.shared.log_op(&mut st, op)?;
@@ -584,6 +692,14 @@ impl Volume {
     pub fn unmount(mut self) -> Result<UnmountReport, VolumeError> {
         let shared = self.shared.clone();
         let rt = self.rt.take().expect("runtime present until unmount");
+        if shared.cfg.read_only {
+            // Nothing was written: nothing to commit, restore or hint.
+            rt.shutdown_timeout(Duration::from_secs(5));
+            return Ok(UnmountReport {
+                head_seq: shared.commit_state().committed.unwrap_or(0),
+                fully_restored: true,
+            });
+        }
         let budget = shared.cfg.restore_on_exit_timeout;
         let result = rt.block_on(async {
             let seq = {
@@ -596,7 +712,11 @@ impl Volume {
             };
             if let Some(seq) = seq {
                 shared.wait_committed(seq).await.map_err(|_| {
-                    VolumeError::Fenced("could not commit the log at unmount".into())
+                    if shared.commit_state().aborted {
+                        VolumeError::Aborted
+                    } else {
+                        VolumeError::Fenced("could not commit the log at unmount".into())
+                    }
                 })?;
             }
             let _ = self.stop.send(true);
@@ -655,7 +775,7 @@ impl Drop for Volume {
     /// and the local WAL is recovered by the next mount on this disk.
     fn drop(&mut self) {
         if let Some(rt) = self.rt.take() {
-            self.shared.abort.store(true, Ordering::SeqCst);
+            self.shared.abort();
             rt.shutdown_background();
         }
     }

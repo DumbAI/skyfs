@@ -21,7 +21,7 @@ pub mod volume;
 pub mod wal;
 pub mod writer;
 
-pub use config::{CreateOptions, FsyncMode, Replication, VolumeConfig};
+pub use config::{AtimeMode, CreateOptions, FsyncMode, Replication, VolumeConfig};
 pub use error::VolumeError;
 pub use mount::MountReport;
-pub use volume::{Done, FsStats, UnmountReport, Volume, create_volume};
+pub use volume::{AbortHandle, Done, FsStats, UnmountReport, Volume, create_volume};

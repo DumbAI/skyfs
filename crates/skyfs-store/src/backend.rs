@@ -2,16 +2,18 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
+use object_store::{ClientOptions, ObjectStore};
 
 use crate::credentials::{
-    BrokerSource, CredentialError, CredentialSource, FileSource, ProcessSource, Refreshing,
-    refuse_static_env,
+    Access, CredentialError, CredentialSource, FileSource, Refreshing, WebIdentitySource,
+    refuse_static_env, session_policy,
 };
+use crate::key::VolumeRoot;
 
 /// Where a volume's bucket is and how to reach it.
 #[derive(Debug, Clone)]
@@ -26,6 +28,9 @@ pub struct StoreConfig {
     pub allow_http: bool,
     /// Where credentials come from.
     pub credentials: CredentialSource,
+    /// Longest a single request may take, body included. With the upload
+    /// parallelism this sets the slowest link that makes progress.
+    pub request_timeout: Duration,
 }
 
 /// Failure to open a backend.
@@ -51,11 +56,12 @@ pub struct Backend {
     pub prefix: String,
 }
 
-/// Opens the backend `config` names. `volume_id_hex` and `writer_id` scope
-/// broker credentials to one volume and identify the mount.
+/// Opens the backend `config` names. OIDC credentials are narrowed to
+/// `volume_id` (read-only if `read_only`) and their session is named after
+/// `writer_id`.
 pub fn open(
     config: &StoreConfig,
-    volume_id_hex: &str,
+    volume_id: &[u8; 16],
     writer_id: &str,
     read_only: bool,
 ) -> Result<Backend, BackendError> {
@@ -85,27 +91,53 @@ pub fn open(
         return Err(BackendError::Url(url.to_owned()));
     }
 
+    let prefix = prefix.trim_matches('/');
+
+    let builder = AmazonS3Builder::from_env();
     let mut b = match &config.credentials {
-        CredentialSource::Ambient { allow_static } => {
-            if !allow_static {
-                refuse_static_env()?;
-            }
-            AmazonS3Builder::from_env()
+        CredentialSource::Ambient => {
+            refuse_static_env()?;
+            builder
         }
-        CredentialSource::File(path) => AmazonS3Builder::from_env()
-            .with_credentials(Arc::new(Refreshing::new(FileSource::new(path.clone())))),
-        CredentialSource::Process(argv) => AmazonS3Builder::from_env()
-            .with_credentials(Arc::new(Refreshing::new(ProcessSource::new(argv.clone())))),
-        CredentialSource::Broker { url, token_file } => AmazonS3Builder::from_env()
-            .with_credentials(Arc::new(Refreshing::new(BrokerSource::new(
-                url,
-                volume_id_hex.to_owned(),
-                token_file.clone(),
-                writer_id.to_owned(),
-                read_only,
-            )))),
+        CredentialSource::Static { file: None } => {
+            if std::env::var_os("AWS_ACCESS_KEY_ID").is_none() {
+                return Err(CredentialError::Config(
+                    "--credentials static needs --credentials-file or AWS_ACCESS_KEY_ID".into(),
+                )
+                .into());
+            }
+            builder
+        }
+        CredentialSource::Static { file: Some(path) } => {
+            builder.with_credentials(Arc::new(Refreshing::new(FileSource::new(path.clone()))))
+        }
+        CredentialSource::WebIdentity(w) => {
+            let sts = match (&w.sts_endpoint, &config.region) {
+                (Some(e), _) => e.clone(),
+                (None, Some(r)) if r != "auto" => format!("https://sts.{r}.amazonaws.com"),
+                (None, _) => "https://sts.amazonaws.com".to_owned(),
+            };
+            let access = if read_only {
+                Access::ReadOnly
+            } else {
+                Access::ReadWrite
+            };
+            let root = VolumeRoot::new(prefix, volume_id).to_string();
+            let policy = w
+                .session_policy
+                .then(|| session_policy(bucket, &root, access));
+            builder.with_credentials(Arc::new(Refreshing::new(WebIdentitySource::new(
+                &sts,
+                w.role_arn.clone(),
+                w.token_file.clone(),
+                writer_id,
+                policy,
+            ))))
+        }
     };
-    b = b.with_bucket_name(bucket);
+    b = b
+        .with_bucket_name(bucket)
+        .with_client_options(ClientOptions::new().with_timeout(config.request_timeout));
     if let Some(endpoint) = &config.endpoint {
         b = b.with_endpoint(endpoint);
     }
@@ -117,6 +149,6 @@ pub fn open(
     }
     Ok(Backend {
         store: Arc::new(b.build()?),
-        prefix: prefix.trim_matches('/').to_owned(),
+        prefix: prefix.to_owned(),
     })
 }

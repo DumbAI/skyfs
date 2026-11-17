@@ -50,6 +50,9 @@ an immutable write-ahead log in blob storage. Read `docs/design.md` and
 ## Boundaries
 
 - Crates: `skyfs → skyfs-volume → skyfs-meta, skyfs-store → skyfs-format`.
+  skyfs is standalone (library, daemon or sidecar): it depends on no
+  service but the bucket and its STS. No control plane, no lease service;
+  single-writer safety is the in-band fence.
 - `skyfs-format`: on-bucket schemas and codecs, no I/O.
 - `skyfs-meta`: validation (`plan`) and `apply`; no I/O beyond SQLite.
 - `skyfs-store::Key` spells every object key; no other module formats one.
@@ -57,9 +60,22 @@ an immutable write-ahead log in blob storage. Read `docs/design.md` and
 - `skyfs-volume`: the engine. Platform-independent; its end-to-end tests
   use in-memory buckets.
 - FUSE code is Linux-only behind `cfg(target_os = "linux")` in `skyfs`,
-  and stays a thin adapter over `skyfs_volume::Volume`.
-- Credentials are short-lived and refreshed (`skyfs-store::credentials`,
-  design §10.1). Never commit `.env` or keys; never log a secret.
+  and stays a thin adapter over `skyfs_volume::Volume`. Linux + FUSE is
+  the production path.
+- The NFS adapter (`skyfs/src/nfs.rs`, macOS's transport, also runs on
+  Linux) is the same kind of thin adapter: its only state is open write
+  handles. `vendor/` holds third-party code patched for skyfs, wired in by
+  `[patch.crates-io]` and excluded from the workspace; record every
+  change in its `PATCHES.md`.
+- Credentials (`skyfs-store::credentials`, design §10.1): OIDC workload
+  identity (`AssumeRoleWithWebIdentity`, per-volume session policy),
+  the platform's ambient identity, or static keys from a re-read file.
+  Never commit `.env` or keys; never log a secret or a token.
+- Every bucket retry must be idempotent: a lost response means the
+  mutation may have landed. Retry the same bytes (compare on
+  `AlreadyExists`) or use content-addressed keys. `tests/faults.rs`
+  enumerates every mutation with every fault; extend its workload when
+  adding a new kind of object or mutation.
 
 ## Commands
 
@@ -68,5 +84,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
 `libc` constants differ in type between macOS and Linux (`mode_t`), so
-check Linux too (Docker command in README, "Develop"); the FUSE smoke test
-is `scripts/fuse-smoke.sh`.
+check Linux too (Docker command in README, "Develop"). Through the kernel:
+`scripts/fuse-smoke.sh`, `scripts/pjdfstest.sh`, `scripts/xfstests.sh`,
+`scripts/nfs-smoke.sh` (runs on macOS without root);
+real bucket: `scripts/s3-e2e.sh`. Test map and gaps: `docs/testing.md`.

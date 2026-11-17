@@ -10,7 +10,7 @@
 set -euo pipefail
 
 WORK=$(mktemp -d)
-STORE="file://$WORK/bucket"
+STORE="${STORE:-file://$WORK/bucket}"  # or s3://bucket/prefix (SKYFS_REGION etc. from the environment)
 A="$WORK/mnt-a"; B="$WORK/mnt-b"
 mkdir -p "$A" "$B"
 PID=

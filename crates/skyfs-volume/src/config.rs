@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub use skyfs_meta::plan::AtimeMode;
+
 /// When the kernel gets its answer for namespace and attribute operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replication {
@@ -53,6 +55,8 @@ pub struct VolumeConfig {
     pub restore_segments: usize,
     /// Target size of a pack.
     pub pack_size: u64,
+    /// Segments folded per restore pass; each pass publishes a snapshot.
+    pub restore_batch: usize,
     /// How long to keep restoring at unmount.
     pub restore_on_exit_timeout: Duration,
     /// Keep snapshots (and the log after them) this long, for
@@ -60,6 +64,17 @@ pub struct VolumeConfig {
     pub retention: Duration,
     /// Run the background restorer. Disabled only by tests and tools.
     pub restorer: bool,
+    /// Serve the volume as of mount time without writing anything: no
+    /// epoch claimed, no log, no restore; every mutation is EROFS.
+    pub read_only: bool,
+    /// How reads, `readdir` and `readlink` update atime.
+    pub atime: AtimeMode,
+    /// How long mount waits for its `MountBegin` to commit before giving
+    /// up (bucket unreachable).
+    pub mount_timeout: Duration,
+    /// How long mount waits for another process (a previous mount still
+    /// finishing its unmount) to release the local directory.
+    pub local_lock_wait: Duration,
 }
 
 impl VolumeConfig {
@@ -77,13 +92,18 @@ impl VolumeConfig {
             blob_max: 64 << 20,
             blob_uploads: 4,
             cache_limit: 20 << 30,
-            restore_after: Duration::from_secs(300),
+            restore_after: Duration::from_mins(5),
             restore_bytes: 64 << 20,
             restore_segments: 512,
             pack_size: 32 << 20,
-            restore_on_exit_timeout: Duration::from_secs(60),
-            retention: Duration::from_secs(7 * 24 * 3600),
+            restore_batch: 256,
+            restore_on_exit_timeout: Duration::from_mins(1),
+            retention: Duration::from_hours(7 * 24),
             restorer: true,
+            read_only: false,
+            atime: AtimeMode::Relatime,
+            local_lock_wait: Duration::from_mins(2),
+            mount_timeout: Duration::from_mins(5),
         }
     }
 }

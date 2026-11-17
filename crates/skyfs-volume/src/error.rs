@@ -35,6 +35,18 @@ pub enum VolumeError {
     /// snapshot, missing segment. The mount is refused.
     #[error("refusing to mount: {0}")]
     Corrupt(String),
+    /// Another process holds this mount's local directory.
+    #[error("local directory {0} is in use by another skyfs process")]
+    Busy(String),
+    /// The bucket did not answer in time.
+    #[error("timed out: {0}")]
+    Timeout(String),
+    /// The mount was abandoned before the log was committed; the local WAL
+    /// is kept for the next mount on this disk.
+    #[error(
+        "abandoned with uncommitted operations; the local WAL is kept for the next mount on this disk"
+    )]
+    Aborted,
     /// Another writer committed the seq this one needed: this writer is
     /// stale and must stop.
     #[error("fenced: another writer took over the volume ({0})")]

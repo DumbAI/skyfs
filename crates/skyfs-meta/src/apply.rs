@@ -437,8 +437,18 @@ fn rename(cx: &Ctx<'_>, r: &Rename) -> Result<()> {
             }
             _ => return Err(cx.corrupt("Rename target mismatch")),
         }
-        cx.remove_entry(r.old_parent, &r.old_name)?;
-        cx.add_entry(r.new_parent, &r.new_name, src.ino)?;
+        if r.old_parent == r.new_parent {
+            // Renamed in place: the entry keeps its readdir cookie, so a
+            // listing in progress neither revisits it nor runs forever
+            // while a program renames what it lists.
+            cx.exec(
+                "UPDATE dirents SET name = ?3 WHERE parent = ?1 AND name = ?2",
+                params![r.old_parent, r.old_name, r.new_name],
+            )?;
+        } else {
+            cx.remove_entry(r.old_parent, &r.old_name)?;
+            cx.add_entry(r.new_parent, &r.new_name, src.ino)?;
+        }
         if moves_dir(&src) {
             cx.set_parent(src.ino, r.new_parent)?;
             cx.add_nlink(r.old_parent, -1)?;

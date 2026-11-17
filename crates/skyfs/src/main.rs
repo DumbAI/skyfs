@@ -1,16 +1,22 @@
-//! The `skyfs` command: create, mount (FUSE, Linux only), fsck, info.
+//! The `skyfs` command: create, mount (FUSE on Linux, NFS on macOS), fsck,
+//! info.
 
 mod cli;
 #[cfg(target_os = "linux")]
 mod fuse;
+mod nfs;
+mod signal;
 
 use std::process::ExitCode;
 
 use clap::Parser;
 use skyfs_store::{ObjectClient, VolumeRoot, backend, hex};
-use skyfs_volume::{CreateOptions, FsyncMode, Replication, VolumeConfig};
+use skyfs_volume::{AtimeMode, CreateOptions, FsyncMode, Replication, VolumeConfig};
 
-use cli::{Cli, Command, FsyncArg, MountArgs, ReplicationArg, StoreArgs, parse_volume_id};
+use cli::{
+    AtimeArg, Cli, Command, FsyncArg, MountArgs, ReplicationArg, StoreArgs, Transport,
+    parse_volume_id,
+};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -21,8 +27,7 @@ fn client(
     read_only: bool,
 ) -> Result<ObjectClient> {
     let cfg = store.config()?;
-    let b =
-        backend::open(&cfg, &hex(&volume_id), writer_id, read_only).map_err(|e| e.to_string())?;
+    let b = backend::open(&cfg, &volume_id, writer_id, read_only).map_err(|e| e.to_string())?;
     Ok(ObjectClient::new(
         b.store,
         VolumeRoot::new(&b.prefix, &volume_id),
@@ -48,10 +53,11 @@ fn run(cli: Cli) -> Result<()> {
             };
             let c = client(&store, id, "skyfs-create", false)?;
             let scratch = std::env::temp_dir().join(format!("skyfs-create-{}", hex(&id)));
+            let (uid, gid) = cli::default_root_owner();
             let opts = CreateOptions {
                 inline_data_max,
-                root_uid,
-                root_gid,
+                root_uid: root_uid.unwrap_or(uid),
+                root_gid: root_gid.unwrap_or(gid),
                 ..CreateOptions::default()
             };
             skyfs_volume::create_volume(&c, id, &opts, &scratch).map_err(|e| e.to_string())?;
@@ -107,7 +113,13 @@ fn volume_config(args: &MountArgs) -> VolumeConfig {
         ReplicationArg::Sync => Replication::Sync,
         ReplicationArg::Async => Replication::Async,
     };
-    cfg.fsync = match args.fsync {
+    // The NFS client commits at every close, not only at fsync: waiting for
+    // the bucket there would make each close a network round trip.
+    let fsync = args.fsync.unwrap_or(match args.transport {
+        Transport::Fuse => FsyncArg::Remote,
+        Transport::Nfs => FsyncArg::Local,
+    });
+    cfg.fsync = match fsync {
         FsyncArg::Remote => FsyncMode::Remote,
         FsyncArg::Local => FsyncMode::Local,
     };
@@ -115,21 +127,33 @@ fn volume_config(args: &MountArgs) -> VolumeConfig {
     cfg.restore_on_exit_timeout = args.restore_on_exit_timeout;
     cfg.retention = args.retention;
     cfg.cache_limit = args.cache_gib << 30;
+    cfg.read_only = args.read_only;
+    cfg.atime = match args.atime {
+        AtimeArg::Relatime => AtimeMode::Relatime,
+        AtimeArg::Noatime => AtimeMode::NoAtime,
+        AtimeArg::Strictatime => AtimeMode::Strict,
+    };
     cfg
 }
 
-#[cfg(target_os = "linux")]
 fn mount(args: &MountArgs) -> Result<()> {
     let id = parse_volume_id(&args.volume)?;
     let cfg = volume_config(args);
-    let c = client(&args.store, id, &cfg.writer_id, false)?;
-    fuse::serve(c, id, cfg, args)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn mount(args: &MountArgs) -> Result<()> {
-    let _ = volume_config(args);
-    Err("FUSE mounts are Linux-only; run skyfs in a Linux container with /dev/fuse".into())
+    match args.transport {
+        Transport::Nfs => {
+            let c = client(&args.store, id, &cfg.writer_id, args.read_only)?;
+            nfs::serve(c, id, cfg, args)
+        }
+        #[cfg(target_os = "linux")]
+        Transport::Fuse => {
+            let c = client(&args.store, id, &cfg.writer_id, args.read_only)?;
+            fuse::serve(c, id, cfg, args)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Transport::Fuse => Err(
+            "FUSE mounts are Linux-only here; use --transport nfs (the default on macOS)".into(),
+        ),
+    }
 }
 
 fn main() -> ExitCode {

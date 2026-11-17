@@ -59,8 +59,8 @@ pub(crate) async fn run(shared: Arc<Shared>, mut stop: tokio::sync::watch::Recei
         let handles = shared.state.lock().open_sync_handles();
         if let Some((dat, rec)) = handles {
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = dat.sync_data();
-                let _ = rec.sync_data();
+                let _ = crate::wal::sync_data(&dat);
+                let _ = crate::wal::sync_data(&rec);
             })
             .await;
         }
@@ -79,10 +79,10 @@ async fn commit(shared: &Arc<Shared>, seg: &Arc<Sealed>) -> Outcome {
     // Data before reference: every blob this segment points at is uploaded.
     for dep in &seg.blob_deps {
         let rx = shared.uploads.lock().get(dep).cloned();
-        if let Some(mut rx) = rx {
-            if rx.wait_for(|done| *done).await.is_err() {
-                return Outcome::Aborted;
-            }
+        if let Some(mut rx) = rx
+            && rx.wait_for(|done| *done).await.is_err()
+        {
+            return Outcome::Aborted;
         }
     }
     let seg2 = seg.clone();

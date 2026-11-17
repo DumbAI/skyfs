@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# mount(8) helper, so skyfs mounts like any filesystem:
+#
+#   mount -t fuse.skyfs VOLUME_ID /mnt/data -o store=s3://bucket/prefix,credentials=oidc,role_arn=...
+#   # /etc/fstab
+#   VOLUME_ID  /mnt/data  fuse.skyfs  store=s3://bucket/prefix,_netdev  0 0
+#
+# Install as /sbin/mount.fuse.skyfs. Options of the form key=value whose
+# key is a `skyfs mount` flag (underscores for dashes) pass through as
+# --key value; allow_other, allow_http, dev, suid and the atime options
+# (relatime, noatime, strictatime) are flags; other generic mount options
+# (rw, nodev, nosuid, _netdev, defaults, ...) are ignored.
+# The daemon detaches; this returns once the mount is up. `umount` ends it
+# (clean unmount: drain, MountEnd, restore within its budget).
+set -euo pipefail
+
+[ $# -ge 2 ] || { echo "usage: mount.fuse.skyfs VOLUME_ID MOUNTPOINT [-o options]" >&2; exit 1; }
+src=$1 dir=$2
+shift 2
+opts=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) opts="${opts:+$opts,}$2"; shift 2 ;;
+    -o*) opts="${opts:+$opts,}${1#-o}"; shift ;;
+    *) shift ;; # -n (no mtab), -v, -s, -f: nothing to do
+  esac
+done
+
+# A remount (`mount -o remount,ro DIR`) changes the kernel's flags on the
+# existing mount; there is no new daemon to start. FUSE refuses to
+# reconfigure its superblock, so the flags go on the mount itself (bind
+# remount), which the kernel enforces just the same. -i: no helper again.
+case ",$opts," in
+  *,remount,*)
+    flags=remount,bind
+    IFS=, read -ra list <<<"$opts"
+    for o in "${list[@]}"; do
+      case $o in ro | rw | nosuid | suid | nodev | dev | noexec | exec | noatime | relatime | strictatime)
+        flags="$flags,$o" ;;
+      esac
+    done
+    exec mount -i -o "$flags" "$dir" ;;
+esac
+
+skyfs=${SKYFS_BIN:-$(command -v skyfs || echo /usr/local/bin/skyfs)}
+cache=/var/cache/skyfs/$src
+args=()
+IFS=, read -ra list <<<"$opts"
+for o in "${list[@]}"; do
+  key=${o%%=*} val=${o#*=}
+  case $key in
+    cache_dir) cache=$val ;;
+    store | endpoint | region | credentials | credentials_file | role_arn \
+      | web_identity_token_file | sts_endpoint | request_timeout | replication | fsync | max_lag | restore_on_exit_timeout | retention | cache_gib | threads \
+      | atime | subtype)
+      args+=("--${key//_/-}" "$val") ;;
+    allow_other | allow_http | no_session_policy | dev | suid) args+=("--${key//_/-}") ;;
+    noatime | strictatime | relatime) args+=(--atime "$key") ;;
+    ro) args+=(--read-only) ;;
+    *) ;;
+  esac
+done
+
+mkdir -p "$cache"
+log=$cache/skyfs.log
+setsid "$skyfs" mount --volume "$src" --cache-dir "$cache" --fsname "$src" "${args[@]}" "$dir" \
+  </dev/null >>"$log" 2>&1 &
+pid=$!
+# Up to the daemon's wait for a previous mount of this cache dir, plus replay.
+for _ in $(seq 1800); do
+  mountpoint -q "$dir" && exit 0
+  kill -0 "$pid" 2>/dev/null || break
+  sleep 0.1
+done
+echo "mount.fuse.skyfs: $src on $dir failed:" >&2
+tail -20 "$log" >&2
+kill "$pid" 2>/dev/null || true
+exit 1

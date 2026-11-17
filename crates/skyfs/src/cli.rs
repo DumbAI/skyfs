@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use skyfs_store::{CredentialSource, StoreConfig};
+use skyfs_store::{CredentialSource, StoreConfig, WebIdentityConfig};
 
 /// skyfs: a POSIX filesystem whose source of truth is a log in blob storage.
 #[derive(Debug, Parser)]
@@ -26,12 +26,14 @@ pub enum Command {
         /// Largest write stored inline in a log segment.
         #[arg(long, default_value_t = 1 << 20)]
         inline_data_max: u32,
-        /// Root directory owner uid.
-        #[arg(long, default_value_t = 0)]
-        root_uid: u32,
-        /// Root directory group gid.
-        #[arg(long, default_value_t = 0)]
-        root_gid: u32,
+        /// Root directory owner uid. Default: root on Linux, where the
+        /// daemon runs as root for containers; on macOS, the user running
+        /// `create`, who also runs the mount.
+        #[arg(long)]
+        root_uid: Option<u32>,
+        /// Root directory group gid (default as for `--root-uid`).
+        #[arg(long)]
+        root_gid: Option<u32>,
     },
     /// Mount a volume with FUSE (Linux) and serve until unmounted or signalled.
     Mount(MountArgs),
@@ -53,6 +55,8 @@ pub enum Command {
     },
 }
 
+// Command-line flags are naturally booleans.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 pub struct MountArgs {
     #[command(flatten)]
@@ -65,12 +69,18 @@ pub struct MountArgs {
     pub cache_dir: PathBuf,
     /// Where to mount.
     pub mountpoint: PathBuf,
+    /// How the kernel reaches the volume: FUSE (Linux, the production path)
+    /// or `NFSv3` served on localhost (macOS, where it is the default; also
+    /// works on Linux).
+    #[arg(long, value_enum, env = "SKYFS_TRANSPORT", default_value_t = Transport::default_for_os())]
+    pub transport: Transport,
     /// When namespace operations are acknowledged.
     #[arg(long, value_enum, default_value_t = ReplicationArg::Async)]
     pub replication: ReplicationArg,
-    /// Where fsync waits in async mode.
-    #[arg(long, value_enum, default_value_t = FsyncArg::Remote)]
-    pub fsync: FsyncArg,
+    /// Where fsync waits in async mode. Default: `remote` with FUSE;
+    /// `local` with NFS, whose client also commits at every close.
+    #[arg(long, value_enum)]
+    pub fsync: Option<FsyncArg>,
     /// Async mode: upload a segment at most this long after its first op.
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     pub max_lag: Duration,
@@ -87,9 +97,60 @@ pub struct MountArgs {
     /// unless root).
     #[arg(long)]
     pub allow_other: bool,
-    /// FUSE worker threads.
+    /// FUSE worker threads (NFS: server threads).
     #[arg(long, default_value_t = 8)]
     pub threads: usize,
+    /// Source shown in /proc/mounts (`mount.fuse.skyfs` passes the volume id).
+    #[arg(long, default_value = "skyfs")]
+    pub fsname: String,
+    /// Filesystem subtype: the mount's type is `fuse.<subtype>`, or plain
+    /// `fuse` when empty.
+    #[arg(long, default_value = "skyfs")]
+    pub subtype: String,
+    /// How reads update access times.
+    #[arg(long, value_enum, default_value_t = AtimeArg::Relatime)]
+    pub atime: AtimeArg,
+    /// Serve the volume as of mount time, read-only: no lease, no writes,
+    /// read-only credentials.
+    #[arg(long)]
+    pub read_only: bool,
+    /// Honour device nodes on the volume (`dev`; default `nodev`).
+    #[arg(long)]
+    pub dev: bool,
+    /// Honour set-uid/set-gid bits on the volume (`suid`; default `nosuid`).
+    #[arg(long)]
+    pub suid: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Transport {
+    /// FUSE through `/dev/fuse` (Linux).
+    Fuse,
+    /// `NFSv3` served by the daemon on 127.0.0.1, mounted with the system's
+    /// NFS client (no kernel extension or install on macOS).
+    Nfs,
+}
+
+impl Transport {
+    /// FUSE on Linux, NFS elsewhere.
+    #[must_use]
+    pub fn default_for_os() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Fuse
+        } else {
+            Self::Nfs
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AtimeArg {
+    /// Update atime when it is older than mtime or ctime, or a day old.
+    Relatime,
+    /// Never update atime on access.
+    Noatime,
+    /// Update atime on every open for reading, read and listing.
+    Strictatime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -106,14 +167,14 @@ pub enum FsyncArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CredentialKind {
-    /// Workload identity: IRSA, EKS Pod Identity, ECS, instance roles.
+    /// The platform identity: EKS Pod Identity, ECS, instance roles, IRSA.
     Ambient,
-    /// A AWS credential-process JSON file kept fresh by an agent.
-    File,
-    /// A command printing AWS credential-process JSON.
-    Process,
-    /// The skyfs credential broker, with a workload token.
-    Broker,
+    /// Static keys from `--credentials-file` or `AWS_ACCESS_KEY_ID` (R2,
+    /// stores without identity federation).
+    Static,
+    /// OIDC workload identity: exchange a token (Kubernetes projected
+    /// service-account token, SPIFFE JWT) at STS, `AssumeRoleWithWebIdentity`.
+    Oidc,
 }
 
 /// Where the bucket is and how to authenticate (design §10.1).
@@ -131,55 +192,52 @@ pub struct StoreArgs {
     /// Allow plain-HTTP endpoints (local test servers only).
     #[arg(long)]
     pub allow_http: bool,
+    /// Longest one bucket request may take. The default suits uplinks down
+    /// to about 2 Mbit/s; raise it for slower links.
+    #[arg(long, env = "SKYFS_REQUEST_TIMEOUT", default_value = "5m", value_parser = parse_duration)]
+    pub request_timeout: Duration,
     /// Credential source.
     #[arg(long, value_enum, env = "SKYFS_CREDENTIALS", default_value_t = CredentialKind::Ambient)]
     pub credentials: CredentialKind,
-    /// `file`: path of the AWS credential-process JSON file.
+    /// `static`: AWS credential-process JSON file, re-read so a rotated
+    /// Secret is picked up (default: the `AWS_*` environment variables).
     #[arg(long, env = "SKYFS_CREDENTIALS_FILE")]
     pub credentials_file: Option<PathBuf>,
-    /// `process`: the command (split on whitespace).
-    #[arg(long, env = "SKYFS_CREDENTIALS_COMMAND")]
-    pub credentials_command: Option<String>,
-    /// `broker`: base URL of the credential broker.
-    #[arg(long, env = "SKYFS_BROKER_URL")]
-    pub broker_url: Option<String>,
-    /// `broker`: file holding the workload token (re-read on each exchange).
-    #[arg(long, env = "SKYFS_BROKER_TOKEN_FILE")]
-    pub broker_token_file: Option<PathBuf>,
-    /// `ambient`: accept long-lived static keys from the environment
-    /// (development only).
+    /// `oidc`: the role to assume.
+    #[arg(long, env = "AWS_ROLE_ARN")]
+    pub role_arn: Option<String>,
+    /// `oidc`: file holding the OIDC token, re-read on every exchange.
+    #[arg(long, env = "AWS_WEB_IDENTITY_TOKEN_FILE")]
+    pub web_identity_token_file: Option<PathBuf>,
+    /// `oidc`: STS endpoint (default `https://sts.<region>.amazonaws.com`;
+    /// MinIO, Ceph RGW and Backblaze B2 have their own).
+    #[arg(long, env = "AWS_ENDPOINT_URL_STS")]
+    pub sts_endpoint: Option<String>,
+    /// `oidc`: do not narrow the credential to the volume with a session
+    /// policy (for an STS that rejects `Policy`).
     #[arg(long)]
-    pub allow_static_credentials: bool,
+    pub no_session_policy: bool,
 }
 
 impl StoreArgs {
     pub fn config(&self) -> Result<StoreConfig, String> {
         let credentials = match self.credentials {
-            CredentialKind::Ambient => CredentialSource::Ambient {
-                allow_static: self.allow_static_credentials,
+            CredentialKind::Ambient => CredentialSource::Ambient,
+            CredentialKind::Static => CredentialSource::Static {
+                file: self.credentials_file.clone(),
             },
-            CredentialKind::File => CredentialSource::File(
-                self.credentials_file
+            CredentialKind::Oidc => CredentialSource::WebIdentity(WebIdentityConfig {
+                role_arn: self
+                    .role_arn
                     .clone()
-                    .ok_or("--credentials file needs --credentials-file")?,
-            ),
-            CredentialKind::Process => {
-                let cmd = self
-                    .credentials_command
-                    .as_deref()
-                    .ok_or("--credentials process needs --credentials-command")?;
-                CredentialSource::Process(cmd.split_whitespace().map(str::to_owned).collect())
-            }
-            CredentialKind::Broker => CredentialSource::Broker {
-                url: self
-                    .broker_url
-                    .clone()
-                    .ok_or("--credentials broker needs --broker-url")?,
-                token_file: self
-                    .broker_token_file
-                    .clone()
-                    .ok_or("--credentials broker needs --broker-token-file")?,
-            },
+                    .ok_or("--credentials oidc needs --role-arn (AWS_ROLE_ARN)")?,
+                token_file: self.web_identity_token_file.clone().ok_or(
+                    "--credentials oidc needs --web-identity-token-file \
+                     (AWS_WEB_IDENTITY_TOKEN_FILE)",
+                )?,
+                sts_endpoint: self.sts_endpoint.clone(),
+                session_policy: !self.no_session_policy,
+            }),
         };
         Ok(StoreConfig {
             url: self.store.clone(),
@@ -187,7 +245,22 @@ impl StoreArgs {
             region: self.region.clone(),
             allow_http: self.allow_http,
             credentials,
+            request_timeout: self.request_timeout,
         })
+    }
+}
+
+/// The owner of a new volume's root directory when `--root-uid` /
+/// `--root-gid` are not given: root on Linux, the current user on macOS.
+#[must_use]
+pub fn default_root_owner() -> (u32, u32) {
+    if cfg!(target_os = "macos") {
+        (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        )
+    } else {
+        (0, 0)
     }
 }
 
@@ -227,7 +300,7 @@ mod tests {
     #[test]
     fn durations() {
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
-        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_hours(168));
         assert!(parse_duration("1y").is_err());
     }
 
@@ -236,6 +309,17 @@ mod tests {
         let id = parse_volume_id("000102030405060708090a0b0c0d0e0f").unwrap();
         assert_eq!(id[15], 15);
         assert!(parse_volume_id("xyz").is_err());
+    }
+
+    #[test]
+    fn root_owner_defaults_to_root_on_linux_and_the_user_on_macos() {
+        let (uid, gid) = default_root_owner();
+        if cfg!(target_os = "macos") {
+            assert_eq!(uid, rustix::process::geteuid().as_raw());
+            assert_eq!(gid, rustix::process::getegid().as_raw());
+        } else {
+            assert_eq!((uid, gid), (0, 0));
+        }
     }
 
     #[test]
