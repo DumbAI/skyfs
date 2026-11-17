@@ -1,10 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Vendored third-party code: built through [patch], never linted as ours.
+exclude = ["vendor/*"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.96"
 repository = "https://github.com/DumbAI/skyfs"
 publish = false
 
@@ -48,3 +50,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 zstd = "0.13.3"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+
+[patch.crates-io]
+# NFS wire layer with a READDIR fix (vendor/nessie-nfsserve/PATCHES.md).
+nessie-nfsserve = { path = "vendor/nessie-nfsserve" }

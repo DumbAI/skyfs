@@ -439,7 +439,7 @@ impl Shared {
                 run.blob = None;
             }
         }
-        let _ = blob.file.sync_data();
+        let _ = crate::wal::sync_data(&blob.file);
         drop(blob.file);
         let (tx, rx) = watch::channel(false);
         self.uploads.lock().insert(key.to_owned(), rx);
@@ -542,8 +542,8 @@ impl Shared {
     pub fn sync_local(&self) -> Result<(), Errno> {
         let handles = self.state.lock().open_sync_handles();
         if let Some((dat, rec)) = handles {
-            dat.sync_data().map_err(io_errno)?;
-            rec.sync_data().map_err(io_errno)?;
+            crate::wal::sync_data(&dat).map_err(io_errno)?;
+            crate::wal::sync_data(&rec).map_err(io_errno)?;
         }
         Ok(())
     }

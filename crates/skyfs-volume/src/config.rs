@@ -92,18 +92,18 @@ impl VolumeConfig {
             blob_max: 64 << 20,
             blob_uploads: 4,
             cache_limit: 20 << 30,
-            restore_after: Duration::from_secs(300),
+            restore_after: Duration::from_mins(5),
             restore_bytes: 64 << 20,
             restore_segments: 512,
             pack_size: 32 << 20,
             restore_batch: 256,
-            restore_on_exit_timeout: Duration::from_secs(60),
-            retention: Duration::from_secs(7 * 24 * 3600),
+            restore_on_exit_timeout: Duration::from_mins(1),
+            retention: Duration::from_hours(7 * 24),
             restorer: true,
             read_only: false,
             atime: AtimeMode::Relatime,
-            local_lock_wait: Duration::from_secs(120),
-            mount_timeout: Duration::from_secs(300),
+            local_lock_wait: Duration::from_mins(2),
+            mount_timeout: Duration::from_mins(5),
         }
     }
 }

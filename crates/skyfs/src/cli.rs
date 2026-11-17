@@ -67,12 +67,18 @@ pub struct MountArgs {
     pub cache_dir: PathBuf,
     /// Where to mount.
     pub mountpoint: PathBuf,
+    /// How the kernel reaches the volume: FUSE (Linux, the production path)
+    /// or `NFSv3` served on localhost (macOS, where it is the default; also
+    /// works on Linux).
+    #[arg(long, value_enum, env = "SKYFS_TRANSPORT", default_value_t = Transport::default_for_os())]
+    pub transport: Transport,
     /// When namespace operations are acknowledged.
     #[arg(long, value_enum, default_value_t = ReplicationArg::Async)]
     pub replication: ReplicationArg,
-    /// Where fsync waits in async mode.
-    #[arg(long, value_enum, default_value_t = FsyncArg::Remote)]
-    pub fsync: FsyncArg,
+    /// Where fsync waits in async mode. Default: `remote` with FUSE;
+    /// `local` with NFS, whose client also commits at every close.
+    #[arg(long, value_enum)]
+    pub fsync: Option<FsyncArg>,
     /// Async mode: upload a segment at most this long after its first op.
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     pub max_lag: Duration,
@@ -89,7 +95,7 @@ pub struct MountArgs {
     /// unless root).
     #[arg(long)]
     pub allow_other: bool,
-    /// FUSE worker threads.
+    /// FUSE worker threads (NFS: server threads).
     #[arg(long, default_value_t = 8)]
     pub threads: usize,
     /// Source shown in /proc/mounts (`mount.fuse.skyfs` passes the volume id).
@@ -112,6 +118,27 @@ pub struct MountArgs {
     /// Honour set-uid/set-gid bits on the volume (`suid`; default `nosuid`).
     #[arg(long)]
     pub suid: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Transport {
+    /// FUSE through `/dev/fuse` (Linux).
+    Fuse,
+    /// `NFSv3` served by the daemon on 127.0.0.1, mounted with the system's
+    /// NFS client (no kernel extension or install on macOS).
+    Nfs,
+}
+
+impl Transport {
+    /// FUSE on Linux, NFS elsewhere.
+    #[must_use]
+    pub fn default_for_os() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Fuse
+        } else {
+            Self::Nfs
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -257,7 +284,7 @@ mod tests {
     #[test]
     fn durations() {
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
-        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_hours(168));
         assert!(parse_duration("1y").is_err());
     }
 

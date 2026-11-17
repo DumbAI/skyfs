@@ -59,8 +59,8 @@ pub(crate) async fn run(shared: Arc<Shared>, mut stop: tokio::sync::watch::Recei
         let handles = shared.state.lock().open_sync_handles();
         if let Some((dat, rec)) = handles {
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = dat.sync_data();
-                let _ = rec.sync_data();
+                let _ = crate::wal::sync_data(&dat);
+                let _ = crate::wal::sync_data(&rec);
             })
             .await;
         }

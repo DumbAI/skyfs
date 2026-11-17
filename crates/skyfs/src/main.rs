@@ -1,8 +1,11 @@
-//! The `skyfs` command: create, mount (FUSE, Linux only), fsck, info.
+//! The `skyfs` command: create, mount (FUSE on Linux, NFS on macOS), fsck,
+//! info.
 
 mod cli;
 #[cfg(target_os = "linux")]
 mod fuse;
+mod nfs;
+mod signal;
 
 use std::process::ExitCode;
 
@@ -11,7 +14,8 @@ use skyfs_store::{ObjectClient, VolumeRoot, backend, hex};
 use skyfs_volume::{AtimeMode, CreateOptions, FsyncMode, Replication, VolumeConfig};
 
 use cli::{
-    AtimeArg, Cli, Command, FsyncArg, MountArgs, ReplicationArg, StoreArgs, parse_volume_id,
+    AtimeArg, Cli, Command, FsyncArg, MountArgs, ReplicationArg, StoreArgs, Transport,
+    parse_volume_id,
 };
 
 type Result<T> = std::result::Result<T, String>;
@@ -108,7 +112,13 @@ fn volume_config(args: &MountArgs) -> VolumeConfig {
         ReplicationArg::Sync => Replication::Sync,
         ReplicationArg::Async => Replication::Async,
     };
-    cfg.fsync = match args.fsync {
+    // The NFS client commits at every close, not only at fsync: waiting for
+    // the bucket there would make each close a network round trip.
+    let fsync = args.fsync.unwrap_or(match args.transport {
+        Transport::Fuse => FsyncArg::Remote,
+        Transport::Nfs => FsyncArg::Local,
+    });
+    cfg.fsync = match fsync {
         FsyncArg::Remote => FsyncMode::Remote,
         FsyncArg::Local => FsyncMode::Local,
     };
@@ -125,19 +135,24 @@ fn volume_config(args: &MountArgs) -> VolumeConfig {
     cfg
 }
 
-#[cfg(target_os = "linux")]
 fn mount(args: &MountArgs) -> Result<()> {
     let id = parse_volume_id(&args.volume)?;
     let cfg = volume_config(args);
-    let c = client(&args.store, id, &cfg.writer_id, args.read_only)?;
-    fuse::serve(c, id, cfg, args)?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn mount(args: &MountArgs) -> Result<()> {
-    let _ = volume_config(args);
-    Err("FUSE mounts are Linux-only; run skyfs in a Linux container with /dev/fuse".into())
+    match args.transport {
+        Transport::Nfs => {
+            let c = client(&args.store, id, &cfg.writer_id, args.read_only)?;
+            nfs::serve(c, id, cfg, args)
+        }
+        #[cfg(target_os = "linux")]
+        Transport::Fuse => {
+            let c = client(&args.store, id, &cfg.writer_id, args.read_only)?;
+            fuse::serve(c, id, cfg, args)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Transport::Fuse => Err(
+            "FUSE mounts are Linux-only here; use --transport nfs (the default on macOS)".into(),
+        ),
+    }
 }
 
 fn main() -> ExitCode {

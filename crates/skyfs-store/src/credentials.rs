@@ -244,7 +244,7 @@ impl fmt::Debug for WebIdentitySource {
 
 /// Lifetime asked of STS: an hour, the longest a role chain allows and the
 /// longest the design lets one credential live.
-pub const WEB_IDENTITY_DURATION: Duration = Duration::from_secs(3600);
+pub const WEB_IDENTITY_DURATION: Duration = Duration::from_hours(1);
 
 impl WebIdentitySource {
     /// A source assuming `role_arn` at `sts_endpoint` with the token in
@@ -400,11 +400,11 @@ pub struct Refreshing<F> {
 
 /// Refresh when less than this much validity remains (or a quarter of the
 /// credential's lifetime, whichever is less).
-pub const REFRESH_MARGIN: Duration = Duration::from_secs(300);
+pub const REFRESH_MARGIN: Duration = Duration::from_mins(5);
 
 /// Re-read sources that give no expiry this often, so a rotated file is
 /// picked up.
-pub const UNDATED_REFRESH: Duration = Duration::from_secs(300);
+pub const UNDATED_REFRESH: Duration = Duration::from_mins(5);
 
 impl<F: Fetch> Refreshing<F> {
     /// Wraps `source`.
@@ -564,7 +564,7 @@ mod tests {
     async fn caches_until_near_expiry() {
         let r = Refreshing::new(Counting {
             calls: AtomicU32::new(0),
-            ttl: Some(Duration::from_secs(3600)),
+            ttl: Some(Duration::from_hours(1)),
             fail_after: u32::MAX,
         });
         assert_eq!(r.get().await.unwrap().key_id, "k0");

@@ -25,10 +25,11 @@ use skyfs_store::ObjectClient;
 use skyfs_volume::{Done, Volume, VolumeConfig};
 
 use crate::cli::MountArgs;
+use crate::signal;
 
 /// Attribute and entry cache lifetime. skyfs is the only writer, so the
 /// kernel's caches never go stale behind its back.
-const TTL: Duration = Duration::from_secs(60);
+const TTL: Duration = Duration::from_mins(1);
 
 struct SkyFs {
     vol: Arc<Volume>,
@@ -709,23 +710,6 @@ fn xattr_reply(reply: ReplyXattr, value: &[u8], size: u32) {
     }
 }
 
-/// Resolves at the next SIGINT or SIGTERM.
-async fn signalled() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-    let terminated = async {
-        match term.as_mut() {
-            Some(t) => {
-                t.recv().await;
-            }
-            None => std::future::pending::<()>().await,
-        }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        () = terminated => {}
-    }
-}
-
 /// Mounts and serves until the mount goes away or SIGINT/SIGTERM, then
 /// unmounts cleanly (drain, `MountEnd`, restore within the budget).
 pub fn serve(
@@ -735,16 +719,7 @@ pub fn serve(
     args: &MountArgs,
 ) -> Result<(), String> {
     let vol = Arc::new(Volume::mount(client, volume_id, cfg).map_err(|e| e.to_string())?);
-    let r = vol.report().clone();
-    tracing::info!(
-        epoch = r.epoch,
-        snapshot = r.snapshot_gen,
-        tail = r.tail_segments,
-        recovered = r.recovered_segments,
-        lost = r.lost_segments,
-        previous_clean = r.previous_clean,
-        "volume mounted"
-    );
+    signal::log_mounted(&vol);
     let destroyed = Arc::new(tokio::sync::Notify::new());
     let notifier = Arc::new(std::sync::OnceLock::new());
     let fs = SkyFs {
@@ -798,7 +773,7 @@ pub fn serve(
         .map_err(|e| e.to_string())?;
     let by_kernel = waiter.block_on(async {
         tokio::select! {
-            () = signalled() => { tracing::info!("signalled; unmounting"); false }
+            () = signal::signalled() => { tracing::info!("signalled; unmounting"); false }
             () = destroyed.notified() => { tracing::info!("unmounted by the kernel"); true }
         }
     });
@@ -812,26 +787,5 @@ pub fn serve(
     };
     ended.map_err(|e| format!("unmounting {}: {e}", args.mountpoint.display()))?;
 
-    let vol = Arc::into_inner(vol).ok_or("volume still referenced after unmount")?;
-    // The unmount waits for the bucket; a second signal gives up on it.
-    let abort = vol.abort_handle();
-    std::thread::spawn(move || {
-        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            rt.block_on(signalled());
-            tracing::warn!(
-                "signalled again: abandoning the unmount; the local WAL is kept for the next mount on this disk"
-            );
-            abort.abort();
-        }
-    });
-    let report = vol.unmount().map_err(|e| e.to_string())?;
-    tracing::info!(
-        head = report.head_seq,
-        fully_restored = report.fully_restored,
-        "clean unmount"
-    );
-    Ok(())
+    signal::unmount_volume(vol)
 }

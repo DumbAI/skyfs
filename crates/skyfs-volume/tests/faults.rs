@@ -309,7 +309,7 @@ fn config(dir: &Path) -> VolumeConfig {
     cfg.group_commit = Duration::from_millis(2);
     // A restore pass every few segments, with GC of everything it can.
     cfg.restore_segments = 3;
-    cfg.restore_after = Duration::from_secs(3600);
+    cfg.restore_after = Duration::from_hours(1);
     cfg.retention = Duration::ZERO;
     cfg.pack_size = 32 * 1024;
     cfg.restore_on_exit_timeout = Duration::from_secs(10);

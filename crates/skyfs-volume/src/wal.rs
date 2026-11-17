@@ -38,6 +38,26 @@ fn frame(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Makes a local file's data durable as the platform's `fsync` does.
+///
+/// On macOS that is `fsync(2)`, as every native filesystem gives an app
+/// that calls `fsync`: the data reaches the drive, without the drive-cache
+/// flush of `F_FULLFSYNC` (which Rust's `sync_data` issues, at 100 times
+/// the cost). Elsewhere it is `fdatasync`. Recovery does not depend on the
+/// order in which synced writes persist: it keeps only the prefix of
+/// records whose bytes verify (design §6.6), and in async mode every op
+/// reaches the bucket within `max-lag` anyway.
+pub(crate) fn sync_data(f: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        rustix::fs::fsync(f).map_err(io::Error::from)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        f.sync_data()
+    }
+}
+
 /// Paths of segment `seq`'s local files.
 #[must_use]
 pub fn rec_path(dir: &Path, seq: u64) -> PathBuf {
@@ -165,8 +185,8 @@ impl OpenSegment {
     /// Makes the segment durable locally and freezes it.
     pub fn seal(self) -> io::Result<Sealed> {
         // Data first: a record on disk must never point at missing bytes.
-        self.dat.sync_data()?;
-        self.rec.sync_data()?;
+        sync_data(&self.dat)?;
+        sync_data(&self.rec)?;
         Ok(Sealed::new(
             &self.dir,
             self.header,

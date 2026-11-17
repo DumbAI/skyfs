@@ -247,6 +247,15 @@ local file runs at each group commit (every 10 ms by default), so a daemon
 crash or container restart on the same disk loses nothing. Reads of
 not-yet-uploaded data are served from the local segment files.
 
+A local sync is the platform's `fsync`: `fdatasync` on Linux, `fsync(2)`
+on macOS. macOS's `fsync(2)` hands data to the drive without flushing the
+drive's cache; `F_FULLFSYNC` does that too, at about 100 times the cost
+(4.4 ms against 0.04 ms on an Apple SSD), and Rust's `sync_data` issues
+it. skyfs gives an `fsync` caller what every macOS filesystem gives it.
+Recovery never depends on synced writes persisting in order: it keeps the
+prefix of records whose bytes verify (§6.6), and in async mode every op
+reaches the bucket within `max-lag`.
+
 ### 6.3 Large writes
 
 A contiguous run of written bytes larger than `inline_data_max` (a
@@ -718,6 +727,7 @@ goes through the daemon, and device nodes are inert under `nodev`.
 | Docker / any runtime with a device and a capability | `--device /dev/fuse --cap-add SYS_ADMIN`, skyfs runs inside the container |
 | Unprivileged container, privileged host (Kubernetes, our own VMs) | skyfs runs on the host or in a privileged sidecar; the mount is bind-propagated into the app container. Later a CSI driver. |
 | No `/dev/fuse` at all (RunPod pods) | No mount possible. A degraded "sync a directory" mode can reuse the same log format; out of scope for v1. |
+| macOS (a developer's laptop) | `--transport nfs` (the default there): the daemon serves NFSv3 on localhost and the system's NFS client mounts it, as the user, with nothing installed (§10.2). |
 
 `mount -t fuse.skyfs VOLUME_ID DIR -o store=...` and `/etc/fstab` work
 through `scripts/mount.fuse.skyfs` (installed as `/sbin/mount.fuse.skyfs`):
@@ -844,6 +854,47 @@ token (minutes of validity, one audience), so the role's permissions
 until the token expires. With `static`: the key, until an operator
 rotates it, which is why `static` is for stores without federation.
 
+### 10.2 macOS: the NFS transport
+
+Linux and FUSE are the production path. On macOS, FUSE needs either a
+kernel extension (macFUSE; on Apple Silicon only after rebooting into
+Reduced Security) or a third-party transport. FUSE-T, tried with skyfs,
+mounts but intermittently loses requests, most likely because the Rust
+FUSE library reads FUSE-T's stream socket as if it were `/dev/fuse` (one
+request per `read`). Instead skyfs uses the one network filesystem client
+every Mac already has.
+
+```
+app ──syscalls──► macOS NFS client ──NFSv3, TCP 127.0.0.1:<port>──► skyfs daemon ──► Volume ──► S3 / R2
+```
+
+`skyfs mount --transport nfs` binds an NFSv3 server to `127.0.0.1` on a
+free port, mounts it with `mount_nfs` (as the user, no root), and serves
+until a signal or a `umount`. The server is a thin adapter over `Volume`,
+like the FUSE one (`crates/skyfs/src/nfs.rs`), on `nessie-nfsserve` (a
+vendored fork of Hugging Face's `nfsserve`, with one fix:
+`vendor/nessie-nfsserve/PATCHES.md`). It also runs on Linux (root,
+`nfs-common`), which is how CI tests it there.
+
+| Concern | Choice |
+|---|---|
+| Library | `nessie-nfsserve`, the one Rust NFSv3 server that honours `UNSTABLE` writes and `COMMIT`; the others answer every write `FILE_SYNC`, which skyfs could only keep with a sync per write. Same 1 MiB transfers and per-RPC concurrency as the rest. |
+| Writes | Answered `UNSTABLE`; the client batches them and sends `COMMIT`, which is `Volume::fsync`. The write verifier changes at every daemon start, so the client resends what it had not seen committed. |
+| `--fsync` default | `local`: the macOS client commits at every `close`, not only at `fsync`, so `remote` would make each close a bucket round trip. `--fsync remote` is still available. |
+| Open files | NFS has no open/close. A write handle opens at a file's first write and is released at `COMMIT`, at remove (so an unlinked file is freed at once), or after 5 s idle. Unlink-while-open is the client's `.nfsXXXX` rename. |
+| File handles | Volume id prefix + inode number, no boot generation: inode numbers belong to the volume, so open files survive a daemon restart with same-disk recovery, and a handle from another volume is `STALE`. |
+| Directory listing | skyfs's stable cookies are the NFS cookies (hard links make the fileid unsuitable). |
+| Mount | NFSv3 over TCP, hard, `intr`, `locallocks` (locks stay in the kernel: one writer), 1 MiB `rsize`/`wsize`, `deadtimeout=60` (a dead daemon's mount is removed after a minute instead of hanging Finder), `nodev`, `nosuid`. |
+| Identity | Creates take the caller's uid/gid from AUTH_UNIX; symlinks and other credential-less creates get the daemon's user. Permissions are not enforced between users: it is a single-user transport for a laptop. Any local process can reach the port. |
+| Locks | `flock` and `fcntl` locks work between processes on the Mac: the kernel keeps them (`locallocks`), which is right for a single writer. |
+| Not supported | xattrs (not in NFSv3; macOS keeps them in `._` files), device nodes and FIFOs (no MKNOD), `fallocate` and `copy_file_range` (not in NFSv3; the client emulates copies). |
+
+Measured on an Apple Silicon MacBook (release build, local bucket): 512 MiB
+sequential write 1.2 GB/s, cold read on an empty cache 1.4 GB/s, 2000
+1 KiB files created in 4.4 s (2.2 ms each), `ls -l` of them 0.2 s, `git
+add` and `commit` of them 3 s. Against S3 (us-east-2) the mount takes
+2.8 s and a remount on an empty cache 2.6 s.
+
 ## 11. Guarantees and failure cases
 
 | Event | Result |
@@ -865,6 +916,7 @@ rotates it, which is why `static` is for stores without federation.
 | Bucket unreachable at unmount | The unmount waits; a second SIGINT/SIGTERM abandons it, keeping the local WAL for the next mount on this disk |
 | A PUT lands but its response is lost | Segments, packs and snapshot metadata are compared or content-addressed; a manifest is retried byte for byte, so the retry recognises its own object |
 | Power loss tears the local WAL | Recovery keeps the prefix of records whose frames, inline bytes and blob chunks all verify |
+| NFS transport: the daemon dies | Calls on the mount fail with `EINTR` when interrupted; after `deadtimeout` (60 s) macOS removes the mount. A restart on the same cache recovers the local WAL, and the client resends uncommitted writes (the verifier changed) |
 | Two daemons on one cache directory | The second waits for the first's lock (`local_lock_wait`), then fails |
 | A segment deleted from the middle of the log | Mount refused: the head probe would stop at the hole, so it checks the hint and the next 16 seqs (§7.3) |
 
@@ -939,7 +991,14 @@ thin FUSE adapter.
 10. **Read-only mounts. Done** (`--read-only`, `-o ro`): snapshot plus
     tail as of mount time, no epoch claimed, nothing written, read-only
     credentials, the local WAL left for the next read-write mount.
-11. **Open:** an offline LIST sweep for crash orphans;
+11. **macOS. Done** (§10.2): the NFS transport, tested in-process against
+    the adapter, through the macOS and Linux kernels' NFS clients
+    (`scripts/nfs-smoke.sh`, in CI on both), with pjdfstest over NFS on
+    Linux (90.4% pass; the rest is MKNOD and multi-user permission checks,
+    which the single-user transport leaves out), and against S3 from a
+    MacBook. It found a READDIR bug in the NFS library
+    (patched) and that `F_FULLFSYNC` made every close cost 28 ms (§6.2).
+12. **Open:** an offline LIST sweep for crash orphans;
     FUSE writeback cache and passthrough; POSIX ACL enforcement
     (`FUSE_POSIX_ACL`; ACL xattrs are stored but not enforced).
 

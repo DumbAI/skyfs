@@ -9,8 +9,10 @@ through the real kernel and the real network.
 
 This document lists every suite, what it proves, how to run it, the bugs
 each one found, and what is still not covered. As of November 2026 the
-workspace has **80 Rust tests** (`cargo test`, about a minute), plus four
+workspace has **88 Rust tests** (`cargo test`, about a minute), plus five
 suites that run through the kernel, one of them against a real bucket.
+Linux with FUSE is the production path; the NFS transport (macOS) has its
+own adapter tests and kernel smoke test on both macOS and Linux.
 
 ## 1. The layers
 
@@ -22,13 +24,15 @@ suites that run through the kernel, one of them against a real bucket.
 | 4 | Engine integration | `skyfs-volume` `tests/engine.rs`, `wal.rs` | any OS, in-memory bucket | mount, write, replicate, recover, restore, fence, end to end | 18 + 2 tests |
 | 5 | Failure injection | `skyfs-volume` `tests/faults.rs` | any OS, in-memory bucket | every fault at every bucket mutation, every crash of recovery, every torn byte of the local WAL | 7 tests, thousands of cases |
 | 6 | Kernel smoke | `scripts/fuse-smoke.sh` | Linux, root | the FUSE adapter end to end, remount on another machine, SIGKILL recovery | 1 script |
+| 6b | NFS adapter, in process | `crates/skyfs/src/nfs.rs` tests | any OS, in-memory bucket | the NFSv3 adapter over a real `Volume`: unstable writes + COMMIT, handle lifetime, readdir paging, file handles, errors | 8 tests |
+| 6c | NFS through the kernel | `scripts/nfs-smoke.sh` | macOS (as the user) and Linux (root) | the same story as the FUSE smoke test through each kernel's NFS client | 1 script |
 | 7 | POSIX conformance | `scripts/pjdfstest.sh` | Linux, root | pjdfstest | 8,798 tests |
 | 8 | Filesystem regression | `scripts/xfstests.sh` | Linux, root | xfstests generic `quick` group through `mount -t fuse.skyfs` | 639 run, 12 excluded |
 | 9 | Real bucket | `scripts/s3-e2e.sh` | Linux, root, S3 | latency, throughput, cold reads, fencing and recovery over the network | 6 scenarios |
 
-Layers 1 to 5 run on every push (`cargo test` in CI) and on macOS. Layers
-6 to 8 run in CI on Linux. Layer 9 needs a bucket and credentials and is
-run by hand.
+Layers 1 to 5 and 6b run on every push (`cargo test` in CI, on Linux and
+macOS). Layers 6 to 8 run in CI on Linux, 6c on both Linux and macOS.
+Layer 9 needs a bucket and credentials and is run by hand.
 
 The layering follows the crates. Each layer tests one crate through its
 public interface and trusts the layers below, so a failure points at one
@@ -234,6 +238,58 @@ The 12 exclusions are in `scripts/xfstests.exclude`, each with its reason:
 | generic/504 | the test kernel does not list FUSE flocks in `/proc/locks` (the lock itself works); re-check on other kernels |
 | generic/732 | mounts one volume twice and uses both; skyfs is single-writer, the second mount fences the first |
 
+## 5b. The NFS transport (layers 6b, 6c)
+
+The macOS transport (design §10.2) is a second thin adapter over
+`Volume`, so it gets the same two kinds of test as the FUSE one.
+
+**In process** (`crates/skyfs/src/nfs.rs`). The `NFSFileSystem` methods are
+plain async functions, so the tests call them against a mounted `Volume`
+on an in-memory bucket, no kernel or client involved:
+
+| Test | What it proves |
+|---|---|
+| `unstable_writes_commit_and_survive_a_remount` | UNSTABLE writes answer UNSTABLE, FILE_SYNC ones sync first; after COMMIT and a remount elsewhere the same file handle names the same bytes |
+| `handles_are_released_at_commit_remove_and_idle` | the only adapter state (write handles) cannot leak: released at COMMIT, by the idle sweep, and at remove, where the unlinked file is freed at once |
+| `readdir_pages_by_cookie` | paging with skyfs's stable cookies returns every entry exactly once |
+| `reads_across_split_extents_end_at_eof` | short reads and `eof` across extents split by an in-place write |
+| `namespace_operations` | mkdir, hard and symbolic links, rename over a file, chmod/truncate/utimes, errno → NFS status |
+| `file_handles_are_scoped_to_the_volume` | a handle from another volume is STALE, a short one BADHANDLE |
+| `a_read_only_mount_says_so` | read-only capability and ROFS |
+| `conversions` | time, device-number and status conversions |
+
+**Through the kernel** (`scripts/nfs-smoke.sh`). The same story as
+`fuse-smoke.sh`: create, write and patch a 24 MiB file, append, hard and
+symbolic links, renames, chmod, truncate, unlink-while-open, an fsynced
+in-place edit, 200 files in a directory; unmount, fsck, remount on an empty
+cache and check every byte; SIGKILL the daemon and check same-disk
+recovery; fsck. It runs as the user on macOS with nothing installed, and as
+root on Linux; CI runs both.
+
+It found:
+- **A READDIR bug in the NFS library.** Plain READDIR ignored the client's
+  cookie and restarted at the first entry, so the Linux client, which pages
+  with READDIR after its first READDIRPLUS, listed a 201-entry directory
+  forever. Patched in `vendor/nessie-nfsserve` (`PATCHES.md`); macOS only
+  uses READDIRPLUS, which was correct.
+- **Every close cost 28 ms on macOS.** The NFS client commits at each
+  close, and the local WAL sync used `F_FULLFSYNC` (Rust's `sync_data` on
+  macOS). Syncing as the platform's `fsync(2)` does (design §6.2) took 2000
+  small files from 57 s to 4.4 s.
+
+**pjdfstest over NFS** (Linux, `SKYFS_TRANSPORT=nfs scripts/pjdfstest.sh`):
+90.4% of the 8,798 tests pass, and the volume passes fsck afterwards. The
+842 failures are what design §10.2 leaves out: device nodes and FIFOs
+(`mknod`, `mkfifo`: no MKNOD) and permission checks between users
+(`chmod`, `chown`, `open`, `rename`, `unlink`… run as other uids: the
+transport is single-user and does not enforce permissions between users).
+It is not in CI; FUSE stays the conformance bar.
+
+On top of that, by hand: the NFS transport from a MacBook against S3
+(us-east-2): mount in 2.8 s, a git repository committed, unmount, remount
+on an empty cache in 2.6 s, a 32 MiB cold read in 1.4 s with its checksum,
+fsck clean.
+
 ## 6. Against a real bucket (layer 9)
 
 `scripts/s3-e2e.sh` runs six scenarios against S3 (or any S3-compatible
@@ -284,6 +340,7 @@ Each guarantee in `CLAUDE.md` and design §11, and the tests that prove it:
 | The log stays short | `restore_passes_move_the_pointer…`; `a_long_backlog_is_restored_in_published_steps` |
 | Credentials refresh and never leak | credentials unit tests; s3-e2e with a re-read file |
 | POSIX behaviour | 22 scenarios; pjdfstest 8,798; xfstests quick |
+| NFS transport (macOS) | 8 adapter tests; `nfs-smoke.sh` on macOS and Linux; a manual S3 run from a MacBook |
 
 ### 7.2 Gaps
 
@@ -301,6 +358,7 @@ What the suites do **not** cover yet, most important first:
 | Scale | 10⁶+ inodes, very long logs, mount time | a benchmark that builds a large volume and tracks mount and replay time |
 | Kernels | 3 xfstests exclusions are blamed on the test kernel | run xfstests on a stock Ubuntu kernel |
 | Code coverage numbers | not measured | `cargo llvm-cov` over layers 1 to 5 in CI |
+| NFS transport conformance | pjdfstest over NFS passes 90.4%, run by hand; the failures are MKNOD and multi-user permission checks | permission checks against the AUTH_UNIX caller (`ACCESS` and each operation); MKNOD; then pjdfstest over NFS in CI with what remains listed, like `xfstests.exclude` |
 | Concurrency | FUSE threads are exercised by the kernel suites, not stressed | xfstests `auto` group and fsstress with many processes |
 
 ## 8. Running the tests
@@ -317,14 +375,18 @@ cargo build -p skyfs && sudo env PATH="$PWD/target/debug:$PATH" scripts/fuse-smo
 cargo build -p skyfs && sudo env PATH="$PWD/target/debug:$PATH" scripts/pjdfstest.sh
 cargo build --release -p skyfs && sudo env PATH="$PWD/target/release:$PATH" scripts/xfstests.sh -g quick
 
+# The NFS transport: macOS as your user (Linux: sudo, nfs-common).
+cargo build -p skyfs && PATH="$PWD/target/debug:$PATH" scripts/nfs-smoke.sh
+
 # Layer 9: a real bucket. Leaves the volume under STORE; delete the prefix after.
 cargo build --release -p skyfs
 sudo env PATH="$PWD/target/release:$PATH" STORE=s3://bucket/prefix SKYFS_REGION=us-east-2 \
   SKYFS_CREDENTIALS=static SKYFS_CREDENTIALS_FILE=/run/skyfs/creds.json scripts/s3-e2e.sh
 ```
 
-CI (`.github/workflows/ci.yml`) runs four jobs on every push: `rust`
-(fmt, clippy, `cargo test`), `fuse` (smoke), `pjdfstest`, and `xfstests`.
+CI (`.github/workflows/ci.yml`) runs five jobs on every push: `rust`
+(fmt, clippy, `cargo test`, on Linux and macOS), `fuse` (smoke), `nfs`
+(NFS smoke on Linux and macOS), `pjdfstest`, and `xfstests`.
 
 **Rules for extending the suites:**
 

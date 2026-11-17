@@ -65,7 +65,7 @@ impl Bucket {
     fn mount(&self, dir: &Path, f: impl FnOnce(&mut VolumeConfig)) -> Result<Volume, VolumeError> {
         let mut cfg = VolumeConfig::new(dir.to_path_buf());
         cfg.max_lag = Duration::from_millis(20);
-        cfg.restore_after = Duration::from_secs(3600);
+        cfg.restore_after = Duration::from_hours(1);
         cfg.retention = Duration::ZERO;
         cfg.restore_on_exit_timeout = Duration::from_secs(20);
         f(&mut cfg);
@@ -208,7 +208,7 @@ fn crash_on_same_disk_recovers_the_local_wal() {
     let m = tempfile::tempdir().unwrap();
     // Nothing is uploaded on its own for an hour.
     let v = b
-        .mount(m.path(), |c| c.max_lag = Duration::from_secs(3600))
+        .mount(m.path(), |c| c.max_lag = Duration::from_hours(1))
         .unwrap();
     let f = write_file(&v, ROOT_INO, "notes", b"unreplicated", 5);
     mkdir(&v, ROOT_INO, "d");
@@ -229,7 +229,7 @@ fn machine_loss_in_async_mode_loses_only_the_unreplicated_tail() {
     let b = Bucket::new();
     let m1 = tempfile::tempdir().unwrap();
     let v = b
-        .mount(m1.path(), |c| c.max_lag = Duration::from_secs(3600))
+        .mount(m1.path(), |c| c.max_lag = Duration::from_hours(1))
         .unwrap();
     let kept = write_file(&v, ROOT_INO, "kept", b"durable", 100);
     v.finish(v.fsync().unwrap()).unwrap();
@@ -251,7 +251,7 @@ fn sync_mode_acknowledges_after_commit() {
     let v = b
         .mount(m1.path(), |c| {
             c.replication = Replication::Sync;
-            c.max_lag = Duration::from_secs(3600);
+            c.max_lag = Duration::from_hours(1);
         })
         .unwrap();
     let req = MakeRequest {
