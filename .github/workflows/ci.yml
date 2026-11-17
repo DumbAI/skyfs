@@ -96,5 +96,14 @@ jobs:
           sudo apt-get install -y fuse3 attr acl xfslibs-dev uuid-dev libtool-bin e2fsprogs \
             automake gcc make libacl1-dev libaio-dev xfsprogs libgdbm-dev gawk fio uuid-runtime \
             python3 sqlite3 libcap2-bin bc psmisc libattr1-dev liburing-dev libinih-dev quota
+      # xfstests' expected outputs are GNU coreutils' messages; Ubuntu 26.04
+      # defaults to the Rust coreutils (uutils), whose wording differs
+      # ("(os error 1)") and whose `touch -d` rejects dates past 2038.
+      - name: GNU coreutils
+        run: |
+          if apt-cache show coreutils-from-gnu >/dev/null 2>&1; then
+            sudo apt-get install -y coreutils-from-gnu coreutils-from-uutils- --allow-remove-essential
+          fi
+          ls --version | head -1
       - run: cargo build --release -p skyfs
       - run: sudo env PATH="$PWD/target/release:$PATH" scripts/xfstests.sh -g quick

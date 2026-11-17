@@ -237,6 +237,17 @@ The 12 exclusions are in `scripts/xfstests.exclude`, each with its reason:
 | generic/633, 688 | file capabilities: the test kernel (linuxkit 7.0) answers `EINVAL` before reaching the filesystem; re-check on other kernels |
 | generic/504 | the test kernel does not list FUSE flocks in `/proc/locks` (the lock itself works); re-check on other kernels |
 | generic/732 | mounts one volume twice and uses both; skyfs is single-writer, the second mount fences the first |
+| generic/798 | `cachestat` expects written pages to stay dirty until `fsync`; skyfs's FUSE mount writes through (no writeback cache, an open item) |
+
+**The CI runner.** Two things the job needs that a laptop hides:
+- *Disk.* A hosted runner has about 14 GiB free, and a full disk kills the
+  runner without leaving a log. Test volumes mount with `retention=0s`
+  (GC deletes what each restore pass supersedes) and `cache_gib=1`; the
+  job first frees about 30 GiB of preinstalled SDKs; a watchdog in
+  `xfstests.sh` stops the run with a usage breakdown below 2 GiB free.
+  Measured peak: 11.4 GiB.
+- *GNU coreutils.* The expected outputs are GNU's messages; Ubuntu 26.04
+  defaults to the Rust coreutils, so the job installs `coreutils-from-gnu`.
 
 ## 5b. The NFS transport (layers 6b, 6c)
 

@@ -30,3 +30,8 @@ generic/504
 # Mounts one volume twice at once and uses both. skyfs is single-writer
 # (design R6, §6.5): the second mount fences the first, whose writes fail.
 generic/732
+
+# cachestat: expects written pages to stay dirty in the page cache until
+# fsync. skyfs's FUSE mount writes through (no FUSE writeback cache, an
+# open item in docs/design.md §12), so they are never dirty.
+generic/798

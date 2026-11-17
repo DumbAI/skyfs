@@ -987,7 +987,8 @@ thin FUSE adapter.
    read-only mounts and remounts; `nodev` blocking device-node tests. The
    12 exclusions, each with its reason, are in `scripts/xfstests.exclude`:
    ACLs, the kernel's old S_ISGID rule for FUSE, two behaviours of the
-   test kernel to re-check elsewhere, and the single-writer rule.
+   test kernel to re-check elsewhere, the single-writer rule, and page
+   cache dirtiness (no writeback cache).
 10. **Read-only mounts. Done** (`--read-only`, `-o ro`): snapshot plus
     tail as of mount time, no epoch claimed, nothing written, read-only
     credentials, the local WAL left for the next read-write mount.
