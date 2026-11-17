@@ -9,11 +9,16 @@ permissions:
   contents: read
 
 jobs:
+  # Linux is the production platform; macOS builds the NFS transport and
+  # the macOS-only code paths (local sync).
   rust:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.92
+      - uses: dtolnay/rust-toolchain@1.96
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -27,18 +32,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.92
+      - uses: dtolnay/rust-toolchain@1.96
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y fuse3 attr
       - run: cargo build -p skyfs
       - run: sudo env PATH="$PWD/target/debug:$PATH" scripts/fuse-smoke.sh
+
+  # The NFS transport through each kernel's own NFS client: the same story
+  # as the FUSE smoke test. macOS runs it as the runner's user (no root,
+  # nothing installed); Linux needs root and nfs-common.
+  nfs:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nfs-common
+      - run: cargo build -p skyfs
+      - if: runner.os == 'Linux'
+        run: sudo env PATH="$PWD/target/debug:$PATH" scripts/nfs-smoke.sh
+      - if: runner.os == 'macOS'
+        run: env PATH="$PWD/target/debug:$PATH" scripts/nfs-smoke.sh
 
   # POSIX conformance (design §9): the full pjdfstest suite on a skyfs mount.
   pjdfstest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.92
+      - uses: dtolnay/rust-toolchain@1.96
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y fuse3 autoconf automake gcc make
       - run: cargo build -p skyfs
@@ -51,8 +76,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
+      # The run writes many GiB (bucket, caches, results on the root disk);
+      # a hosted runner has about 14 GiB free, and a full disk kills the
+      # runner without a log. Drop preinstalled SDKs this job never uses.
+      # Inline rather than a third-party action: it runs as root.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost \
+            /usr/local/share/powershell /usr/local/lib/node_modules /opt/az /opt/microsoft
+          sudo docker image prune --all --force >/dev/null || true
+          df -h /
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.92
+      - uses: dtolnay/rust-toolchain@1.96
       - uses: Swatinem/rust-cache@v2
       - run: |
           sudo apt-get update
