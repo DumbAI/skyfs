@@ -395,6 +395,38 @@ fn readdir_cookies_are_stable_across_changes() {
 }
 
 #[test]
+fn renaming_while_listing_ends() {
+    // `for each entry: rename it` must terminate (xfstests generic/736): a
+    // rename within the directory keeps the entry's place.
+    let mut h = Harness::new();
+    for i in 0..50 {
+        h.create(ROOT_INO, &format!("f{i}")).unwrap();
+    }
+    let mut after = 0;
+    let mut seen = 0;
+    loop {
+        let batch = h.live.readdir(ROOT_INO, after, 7).unwrap();
+        let Some(last) = batch.last() else { break };
+        after = last.cookie;
+        for e in batch {
+            let name = String::from_utf8(e.name).unwrap();
+            h.rename(
+                ROOT_INO,
+                &name,
+                ROOT_INO,
+                &format!("{name}x"),
+                RenameMode::Unspecified,
+            )
+            .unwrap();
+            seen += 1;
+        }
+        assert!(seen <= 50, "an entry came back");
+    }
+    assert_eq!(seen, 50);
+    h.check();
+}
+
+#[test]
 fn setgid_directories_pass_on_their_group() {
     let mut h = Harness::new();
     let d = h.mkdir(ROOT_INO, "shared").unwrap();

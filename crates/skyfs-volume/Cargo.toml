@@ -28,6 +28,7 @@ zstd.workspace = true
 
 [dev-dependencies]
 object_store.workspace = true
+skyfs-store = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 [lints]

@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use prost::Message;
-use skyfs_format::wal::v1::{Record, SegmentHeader, data_ref, record::Op};
+use skyfs_format::wal::v1::{BlobRange, Record, SegmentHeader, data_ref, record::Op};
 use skyfs_format::{PREAMBLE_LEN, Preamble, records_digest};
+use skyfs_store::Key;
 
 const FRAME_HEADER: usize = 8;
 
@@ -147,12 +148,11 @@ impl OpenSegment {
         if self.first_at.is_none() {
             self.first_at = Some(Instant::now());
         }
-        if let Some(Op::Write(w)) = &record.op {
-            if let Some(data_ref::Location::Blob(b)) =
+        if let Some(Op::Write(w)) = &record.op
+            && let Some(data_ref::Location::Blob(b)) =
                 w.data.as_ref().and_then(|d| d.location.as_ref())
-            {
-                self.blob_deps.insert(b.key.clone());
-            }
+        {
+            self.blob_deps.insert(b.key.clone());
         }
         Ok(())
     }
@@ -302,6 +302,25 @@ pub fn recover(dir: &Path) -> io::Result<Vec<Sealed>> {
     Ok(out)
 }
 
+/// Whether the bytes a blob write references are intact on this disk, or
+/// no longer here because the blob was uploaded.
+fn local_blob_ok(dir: &Path, b: &BlobRange, crc: u32) -> bool {
+    let Ok(Key::Blob { epoch, n }) = b.key.parse::<Key>() else {
+        return false;
+    };
+    let path = blob_path(dir, epoch, n);
+    let Ok(mut f) = File::open(&path) else {
+        return !path.exists();
+    };
+    let Ok(len) = usize::try_from(b.len) else {
+        return false;
+    };
+    let mut buf = vec![0u8; len];
+    f.seek(SeekFrom::Start(b.offset)).is_ok()
+        && f.read_exact(&mut buf).is_ok()
+        && crc32c::crc32c(&buf) == crc
+}
+
 fn recover_one(dir: &Path, seq: u64) -> io::Result<Option<Sealed>> {
     let rec = fs::read(rec_path(dir, seq))?;
     let data = fs::read(dat_path(dir, seq)).unwrap_or_default();
@@ -349,6 +368,12 @@ fn recover_one(dir: &Path, seq: u64) -> io::Result<Option<Sealed>> {
                     }
                 }
                 Some(data_ref::Location::Blob(b)) => {
+                    // Likewise for a blob still on this disk. One that is
+                    // gone was uploaded whole before it left (it moves to
+                    // the cache only after its upload).
+                    if !local_blob_ok(dir, b, w.crc32c) {
+                        break;
+                    }
                     deps.insert(b.key.clone());
                 }
                 None => break,

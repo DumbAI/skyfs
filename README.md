@@ -22,21 +22,25 @@ S3), mounted with FUSE by one writer at a time, on any cloud.
 - **Crash-consistent.** After any crash the volume is the result of a prefix
   of the operations, never a mixture.
 
-- **No long-lived keys.** A mount holds one credential at a time, scoped
-  to its volume's prefix and valid for at most an hour: workload identity
-  on AWS, or the skyfs credential broker anywhere else, refreshed in place.
+- **Standalone.** A daemon or sidecar that needs only the bucket: no
+  control plane. It authenticates with OIDC workload identity (a
+  Kubernetes service-account token exchanged at STS for an hour-long
+  credential narrowed to its volume, no stored secret) or, for stores
+  without federation such as R2, static keys from a mounted secret.
 
 Status: v1 implemented and tested end to end through FUSE on Linux;
-passes the full pjdfstest suite (8,798 tests). Open items (xfstests,
-fault injection, the broker service) are in
+passes the full pjdfstest suite (8,798 tests) and the generic xfstests
+`quick` group (650 tests; 12 exclusions, each justified in
+`scripts/xfstests.exclude`); fault
+injection at every bucket mutation, every point of recovery and every
+torn byte of the local WAL. Open items are in
 [design §12](docs/design.md#12-build-order-and-what-settles-the-open-questions).
 
 ## Use
 
 ```sh
 # Create a volume (prints its id).
-skyfs create --store s3://bucket/tenant --endpoint https://<account>.r2.cloudflarestorage.com --region auto \
-  --credentials broker --broker-url https://skyfs.internal --broker-token-file /run/skyfs/token
+skyfs create --store s3://bucket/tenant --region us-east-2
 
 # Mount it (Linux, /dev/fuse). SIGTERM unmounts cleanly.
 skyfs mount --store s3://bucket/tenant --volume <id> --cache-dir /var/cache/skyfs \
@@ -44,22 +48,67 @@ skyfs mount --store s3://bucket/tenant --volume <id> --cache-dir /var/cache/skyf
 
 skyfs info --store ... --volume <id>   # restore pointer and log head
 skyfs fsck --store ... --volume <id>   # replay from the bucket and check invariants
+
+# Or through mount(8) / fstab, with scripts/mount.fuse.skyfs as /sbin/mount.fuse.skyfs:
+mount -t fuse.skyfs <id> /mnt/data -o store=s3://bucket/tenant,credentials=oidc,...
 ```
+
+Access times follow `--atime relatime` (default), `noatime` or
+`strictatime`. `--read-only` (`-o ro`) serves the volume as of mount time
+and writes nothing. Device nodes and set-id bits are ignored unless the mount
+passes `--dev` / `--suid`.
 
 `--store` also takes `file:///dir` (a local bucket, for testing). Every flag
 has an environment form (`SKYFS_STORE`, `SKYFS_VOLUME`, `SKYFS_CREDENTIALS`,
-...). Credentials (`--credentials`, [design §10.1](docs/design.md#101-authentication-and-credentials)):
+...).
+
+### Credentials
+
+`--credentials` ([design §10.1](docs/design.md#101-authentication-and-credentials)):
 
 | Source | Use it for |
 |---|---|
-| `ambient` (default) | EKS IRSA / Pod Identity, ECS, EC2 roles. Static keys are refused without `--allow-static-credentials` |
-| `broker` | Any Kubernetes (projected service-account token) or orchestrated Docker (one-time mount token); S3 and R2 |
-| `file` | A `credential_process` JSON file kept fresh by Vault Agent or a sidecar |
-| `process` | A command printing `credential_process` JSON |
+| `oidc` | Kubernetes anywhere, with S3, MinIO, Ceph RGW or Backblaze B2. Exchanges the pod's projected service-account token at STS (`AssumeRoleWithWebIdentity`) for a credential valid for an hour and narrowed to the volume. No stored secret. `--role-arn`, `--web-identity-token-file`, `--sts-endpoint` default to `AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ENDPOINT_URL_STS` (set by EKS IRSA) |
+| `ambient` (default) | EKS Pod Identity, ECS task roles, EC2 instance roles. Refuses static keys in the environment |
+| `static` | Stores without identity federation (Cloudflare R2). `--credentials-file` (AWS `credential_process` JSON, re-read so a rotated Secret is picked up) or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. Scope the key to one bucket |
+
+OIDC on Kubernetes (any cluster whose service-account issuer is registered
+as an IAM OIDC provider; on EKS it already is):
+
+```yaml
+# The role's trust policy allows sts:AssumeRoleWithWebIdentity for
+# sub = system:serviceaccount:<ns>:skyfs-<volume>, aud = sts.amazonaws.com.
+containers:
+  - name: skyfs
+    args: [mount, --store, s3://bucket/tenant, --volume, <id>, --credentials, oidc,
+           --cache-dir, /var/cache/skyfs, /mnt/data]
+    env:
+      - {name: AWS_ROLE_ARN, value: arn:aws:iam::<account>:role/skyfs-<volume>}
+      - {name: AWS_WEB_IDENTITY_TOKEN_FILE, value: /var/run/secrets/skyfs/token}
+      - {name: SKYFS_REGION, value: us-east-2}
+    volumeMounts: [{name: token, mountPath: /var/run/secrets/skyfs, readOnly: true}]
+volumes:
+  - name: token
+    projected:
+      sources:
+        - serviceAccountToken: {audience: sts.amazonaws.com, expirationSeconds: 3600, path: token}
+```
+
+Static keys from a Secret (R2):
+
+```sh
+kubectl create secret generic skyfs-r2 --from-literal=credentials.json='{"Version":1,"AccessKeyId":"...","SecretAccessKey":"..."}'
+skyfs mount --store s3://bucket/tenant --endpoint https://<account>.r2.cloudflarestorage.com --region auto \
+  --credentials static --credentials-file /etc/skyfs/credentials.json ...
+```
+
+One mount per volume is the deployment's job (a StatefulSet of one, or
+`Recreate`); if two mount anyway, the newer fences the older through the
+log, and the volume never forks.
 
 In a container: `--device /dev/fuse --cap-add SYS_ADMIN`, or run skyfs on
-the host and bind-propagate the mount so the app container holds no
-credentials at all.
+the host or in a privileged sidecar and bind-propagate the mount so the app
+container holds no credentials at all.
 
 ## Documents
 
@@ -67,6 +116,7 @@ credentials at all.
 |---|---|
 | [docs/design.md](docs/design.md) | Requirements, review of the previous design, alternatives, architecture, credentials, guarantees, build order |
 | [docs/wal-format.md](docs/wal-format.md) | The log format, normative |
+| [docs/testing.md](docs/testing.md) | Test layers, failure injection, kernel and real-bucket suites, coverage and gaps |
 | [proto/skyfs/wal/v1/wal.proto](proto/skyfs/wal/v1/wal.proto) | The log schema, source of truth |
 | [proto/skyfs/snapshot/v1/snapshot.proto](proto/skyfs/snapshot/v1/snapshot.proto) | The snapshot manifest (restore pointer) |
 | [docs/workspace-storage.md](docs/workspace-storage.md) | Background: object store comparison and the read-only predecessor design |
@@ -101,5 +151,10 @@ docker run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:u
    rustup component add clippy && cargo clippy --workspace --all-targets -- -D warnings &&
    cargo build -p skyfs && PATH=/tmp/t/debug:$PATH scripts/fuse-smoke.sh'
 ```
+
+Conformance through the kernel (Linux, root): `scripts/fuse-smoke.sh`,
+`scripts/pjdfstest.sh` and `scripts/xfstests.sh`, as in CI; against a real
+bucket, `scripts/s3-e2e.sh`. What each suite proves:
+[docs/testing.md](docs/testing.md).
 
 No `protoc` is needed: `build.rs` compiles the proto with `protox`.

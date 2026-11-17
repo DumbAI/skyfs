@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use skyfs_store::{CredentialSource, StoreConfig};
+use skyfs_store::{CredentialSource, StoreConfig, WebIdentityConfig};
 
 /// skyfs: a POSIX filesystem whose source of truth is a log in blob storage.
 #[derive(Debug, Parser)]
@@ -53,6 +53,8 @@ pub enum Command {
     },
 }
 
+// Command-line flags are naturally booleans.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 pub struct MountArgs {
     #[command(flatten)]
@@ -90,6 +92,36 @@ pub struct MountArgs {
     /// FUSE worker threads.
     #[arg(long, default_value_t = 8)]
     pub threads: usize,
+    /// Source shown in /proc/mounts (`mount.fuse.skyfs` passes the volume id).
+    #[arg(long, default_value = "skyfs")]
+    pub fsname: String,
+    /// Filesystem subtype: the mount's type is `fuse.<subtype>`, or plain
+    /// `fuse` when empty.
+    #[arg(long, default_value = "skyfs")]
+    pub subtype: String,
+    /// How reads update access times.
+    #[arg(long, value_enum, default_value_t = AtimeArg::Relatime)]
+    pub atime: AtimeArg,
+    /// Serve the volume as of mount time, read-only: no lease, no writes,
+    /// read-only credentials.
+    #[arg(long)]
+    pub read_only: bool,
+    /// Honour device nodes on the volume (`dev`; default `nodev`).
+    #[arg(long)]
+    pub dev: bool,
+    /// Honour set-uid/set-gid bits on the volume (`suid`; default `nosuid`).
+    #[arg(long)]
+    pub suid: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AtimeArg {
+    /// Update atime when it is older than mtime or ctime, or a day old.
+    Relatime,
+    /// Never update atime on access.
+    Noatime,
+    /// Update atime on every open for reading, read and listing.
+    Strictatime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -106,14 +138,14 @@ pub enum FsyncArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CredentialKind {
-    /// Workload identity: IRSA, EKS Pod Identity, ECS, instance roles.
+    /// The platform identity: EKS Pod Identity, ECS, instance roles, IRSA.
     Ambient,
-    /// A AWS credential-process JSON file kept fresh by an agent.
-    File,
-    /// A command printing AWS credential-process JSON.
-    Process,
-    /// The skyfs credential broker, with a workload token.
-    Broker,
+    /// Static keys from `--credentials-file` or `AWS_ACCESS_KEY_ID` (R2,
+    /// stores without identity federation).
+    Static,
+    /// OIDC workload identity: exchange a token (Kubernetes projected
+    /// service-account token, SPIFFE JWT) at STS, `AssumeRoleWithWebIdentity`.
+    Oidc,
 }
 
 /// Where the bucket is and how to authenticate (design §10.1).
@@ -131,55 +163,52 @@ pub struct StoreArgs {
     /// Allow plain-HTTP endpoints (local test servers only).
     #[arg(long)]
     pub allow_http: bool,
+    /// Longest one bucket request may take. The default suits uplinks down
+    /// to about 2 Mbit/s; raise it for slower links.
+    #[arg(long, env = "SKYFS_REQUEST_TIMEOUT", default_value = "5m", value_parser = parse_duration)]
+    pub request_timeout: Duration,
     /// Credential source.
     #[arg(long, value_enum, env = "SKYFS_CREDENTIALS", default_value_t = CredentialKind::Ambient)]
     pub credentials: CredentialKind,
-    /// `file`: path of the AWS credential-process JSON file.
+    /// `static`: AWS credential-process JSON file, re-read so a rotated
+    /// Secret is picked up (default: the `AWS_*` environment variables).
     #[arg(long, env = "SKYFS_CREDENTIALS_FILE")]
     pub credentials_file: Option<PathBuf>,
-    /// `process`: the command (split on whitespace).
-    #[arg(long, env = "SKYFS_CREDENTIALS_COMMAND")]
-    pub credentials_command: Option<String>,
-    /// `broker`: base URL of the credential broker.
-    #[arg(long, env = "SKYFS_BROKER_URL")]
-    pub broker_url: Option<String>,
-    /// `broker`: file holding the workload token (re-read on each exchange).
-    #[arg(long, env = "SKYFS_BROKER_TOKEN_FILE")]
-    pub broker_token_file: Option<PathBuf>,
-    /// `ambient`: accept long-lived static keys from the environment
-    /// (development only).
+    /// `oidc`: the role to assume.
+    #[arg(long, env = "AWS_ROLE_ARN")]
+    pub role_arn: Option<String>,
+    /// `oidc`: file holding the OIDC token, re-read on every exchange.
+    #[arg(long, env = "AWS_WEB_IDENTITY_TOKEN_FILE")]
+    pub web_identity_token_file: Option<PathBuf>,
+    /// `oidc`: STS endpoint (default `https://sts.<region>.amazonaws.com`;
+    /// MinIO, Ceph RGW and Backblaze B2 have their own).
+    #[arg(long, env = "AWS_ENDPOINT_URL_STS")]
+    pub sts_endpoint: Option<String>,
+    /// `oidc`: do not narrow the credential to the volume with a session
+    /// policy (for an STS that rejects `Policy`).
     #[arg(long)]
-    pub allow_static_credentials: bool,
+    pub no_session_policy: bool,
 }
 
 impl StoreArgs {
     pub fn config(&self) -> Result<StoreConfig, String> {
         let credentials = match self.credentials {
-            CredentialKind::Ambient => CredentialSource::Ambient {
-                allow_static: self.allow_static_credentials,
+            CredentialKind::Ambient => CredentialSource::Ambient,
+            CredentialKind::Static => CredentialSource::Static {
+                file: self.credentials_file.clone(),
             },
-            CredentialKind::File => CredentialSource::File(
-                self.credentials_file
+            CredentialKind::Oidc => CredentialSource::WebIdentity(WebIdentityConfig {
+                role_arn: self
+                    .role_arn
                     .clone()
-                    .ok_or("--credentials file needs --credentials-file")?,
-            ),
-            CredentialKind::Process => {
-                let cmd = self
-                    .credentials_command
-                    .as_deref()
-                    .ok_or("--credentials process needs --credentials-command")?;
-                CredentialSource::Process(cmd.split_whitespace().map(str::to_owned).collect())
-            }
-            CredentialKind::Broker => CredentialSource::Broker {
-                url: self
-                    .broker_url
-                    .clone()
-                    .ok_or("--credentials broker needs --broker-url")?,
-                token_file: self
-                    .broker_token_file
-                    .clone()
-                    .ok_or("--credentials broker needs --broker-token-file")?,
-            },
+                    .ok_or("--credentials oidc needs --role-arn (AWS_ROLE_ARN)")?,
+                token_file: self.web_identity_token_file.clone().ok_or(
+                    "--credentials oidc needs --web-identity-token-file \
+                     (AWS_WEB_IDENTITY_TOKEN_FILE)",
+                )?,
+                sts_endpoint: self.sts_endpoint.clone(),
+                session_policy: !self.no_session_policy,
+            }),
         };
         Ok(StoreConfig {
             url: self.store.clone(),
@@ -187,6 +216,7 @@ impl StoreArgs {
             region: self.region.clone(),
             allow_http: self.allow_http,
             credentials,
+            request_timeout: self.request_timeout,
         })
     }
 }

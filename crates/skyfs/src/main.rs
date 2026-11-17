@@ -8,9 +8,11 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use skyfs_store::{ObjectClient, VolumeRoot, backend, hex};
-use skyfs_volume::{CreateOptions, FsyncMode, Replication, VolumeConfig};
+use skyfs_volume::{AtimeMode, CreateOptions, FsyncMode, Replication, VolumeConfig};
 
-use cli::{Cli, Command, FsyncArg, MountArgs, ReplicationArg, StoreArgs, parse_volume_id};
+use cli::{
+    AtimeArg, Cli, Command, FsyncArg, MountArgs, ReplicationArg, StoreArgs, parse_volume_id,
+};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -21,8 +23,7 @@ fn client(
     read_only: bool,
 ) -> Result<ObjectClient> {
     let cfg = store.config()?;
-    let b =
-        backend::open(&cfg, &hex(&volume_id), writer_id, read_only).map_err(|e| e.to_string())?;
+    let b = backend::open(&cfg, &volume_id, writer_id, read_only).map_err(|e| e.to_string())?;
     Ok(ObjectClient::new(
         b.store,
         VolumeRoot::new(&b.prefix, &volume_id),
@@ -115,6 +116,12 @@ fn volume_config(args: &MountArgs) -> VolumeConfig {
     cfg.restore_on_exit_timeout = args.restore_on_exit_timeout;
     cfg.retention = args.retention;
     cfg.cache_limit = args.cache_gib << 30;
+    cfg.read_only = args.read_only;
+    cfg.atime = match args.atime {
+        AtimeArg::Relatime => AtimeMode::Relatime,
+        AtimeArg::Noatime => AtimeMode::NoAtime,
+        AtimeArg::Strictatime => AtimeMode::Strict,
+    };
     cfg
 }
 
@@ -122,8 +129,9 @@ fn volume_config(args: &MountArgs) -> VolumeConfig {
 fn mount(args: &MountArgs) -> Result<()> {
     let id = parse_volume_id(&args.volume)?;
     let cfg = volume_config(args);
-    let c = client(&args.store, id, &cfg.writer_id, false)?;
-    fuse::serve(c, id, cfg, args)
+    let c = client(&args.store, id, &cfg.writer_id, args.read_only)?;
+    fuse::serve(c, id, cfg, args)?;
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -7,9 +7,11 @@
 //! committing `MountBegin` with `If-None-Match: *`.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
@@ -195,7 +197,8 @@ fn apply_segment(
 /// What a finished mount hands to the `Volume`.
 pub(crate) struct Mounted {
     pub shared: Arc<Shared>,
-    pub restorer: Restorer,
+    /// None for a read-only mount.
+    pub restorer: Option<Restorer>,
     pub restore_rx: mpsc::UnboundedReceiver<RestoreMsg>,
     pub report: MountReport,
 }
@@ -237,6 +240,37 @@ fn dirs(root: &Path) -> Result<Dirs, VolumeError> {
         std::fs::create_dir_all(p)?;
     }
     Ok(d)
+}
+
+/// Takes the local directory for this process: two daemons on one
+/// directory would interleave WAL files and metadata. A previous mount
+/// still finishing its unmount holds it, so wait for it, up to `wait`. The
+/// lock is released when the returned file closes, or the process dies.
+async fn lock_local_dir(root: &Path, wait: Duration) -> Result<File, VolumeError> {
+    std::fs::create_dir_all(root)?;
+    let f = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join("lock"))?;
+    let deadline = Instant::now() + wait;
+    let mut logged = false;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                if !logged {
+                    tracing::info!(dir = %root.display(), "waiting for another skyfs process to release the local directory");
+                    logged = true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(VolumeError::Busy(root.display().to_string()));
+            }
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
 }
 
 fn fresh_copy(src: &Path, dest: &Path) -> Result<(), VolumeError> {
@@ -384,6 +418,7 @@ pub(crate) async fn mount(
     cfg: VolumeConfig,
     rt: tokio::runtime::Handle,
 ) -> Result<Mounted, VolumeError> {
+    let local_lock = lock_local_dir(&cfg.local_dir, cfg.local_lock_wait).await?;
     let d = dirs(&cfg.local_dir)?;
     let not_found = || VolumeError::NotFound(client.root().to_string());
     let Replayed {
@@ -394,8 +429,7 @@ pub(crate) async fn mount(
         offsets,
         mut chain,
         ..
-    } = replay(&client, volume_id, &d.meta, true).await?;
-    let replica = replica.expect("asked for a replica");
+    } = replay(&client, volume_id, &d.meta, !cfg.read_only).await?;
     let cache = Arc::new(Cache::open(&d.cache, cfg.cache_limit)?);
     let data = DataReader::new(client.clone(), cache.clone(), d.wal.clone());
     for (seq, off) in offsets {
@@ -410,8 +444,13 @@ pub(crate) async fn mount(
         tail_segments: tail.len() as u64,
         ..MountReport::default()
     };
-    let local: Vec<Sealed> = wal::recover(&d.wal)?;
-    let blobs = wal::local_blobs(&d.wal)?;
+    // A read-only mount writes nothing: this disk's WAL is left for the
+    // next read-write mount to recover.
+    let (local, blobs): (Vec<Sealed>, _) = if cfg.read_only {
+        (Vec::new(), Vec::new())
+    } else {
+        (wal::recover(&d.wal)?, wal::local_blobs(&d.wal)?)
+    };
     let mut lost_files = Vec::new();
     let mut continuing = true;
     for seg in local {
@@ -462,8 +501,10 @@ pub(crate) async fn mount(
             report.lost_segments += 1;
         }
     }
-    for (_, _, path) in wal::local_blobs(&d.wal)? {
-        lost_files.push(path);
+    if !cfg.read_only {
+        for (_, _, path) in wal::local_blobs(&d.wal)? {
+            lost_files.push(path);
+        }
     }
     if !lost_files.is_empty() {
         tracing::warn!(segments = report.lost_segments, dir = %d.lost.display(), "local WAL could not be recovered; kept for inspection");
@@ -478,7 +519,7 @@ pub(crate) async fn mount(
         None => live.position()?.clean,
     };
     let last_op_id = chain.next_op_id - 1;
-    let epoch = live.position()?.epoch.max(chain.epoch) + 1;
+    let epoch = live.position()?.epoch.max(chain.epoch) + u64::from(!cfg.read_only);
     report.previous_clean = previous_clean;
     report.epoch = epoch;
     let pos = LogPosition {
@@ -492,7 +533,7 @@ pub(crate) async fn mount(
     let (restore_tx, restore_rx) = mpsc::unbounded_channel();
     let (commit, _) = watch::channel(CommitState {
         committed: Some(head),
-        fenced: false,
+        ..CommitState::default()
     });
     let shared = Arc::new(Shared {
         upload_slots: Arc::new(Semaphore::new(cfg.blob_uploads.max(1))),
@@ -512,7 +553,17 @@ pub(crate) async fn mount(
         restore_tx,
         abort: AtomicBool::new(false),
         rt,
+        local_lock,
     });
+    let Some(replica) = replica else {
+        // Read-only: no epoch claimed, nothing logged, no restorer.
+        return Ok(Mounted {
+            shared,
+            restorer: None,
+            restore_rx,
+            report,
+        });
+    };
     {
         let mut st = shared.state.lock();
         shared
@@ -544,7 +595,7 @@ pub(crate) async fn mount(
     )?;
     Ok(Mounted {
         shared,
-        restorer,
+        restorer: Some(restorer),
         restore_rx,
         report,
     })

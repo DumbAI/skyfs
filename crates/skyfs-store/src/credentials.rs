@@ -1,11 +1,24 @@
-//! Short-lived, scoped credentials for blob storage (design §10.1).
+//! Credentials for blob storage (design §10.1).
 //!
-//! A skyfs daemon never needs a long-lived key. It holds one credential at
-//! a time, scoped to one volume's prefix and valid for minutes to an hour,
-//! and replaces it before it expires. Every source below yields the same
-//! thing, an S3-style key triple with an expiry, in the AWS
-//! `credential_process` JSON format, so any tool that speaks that format
-//! (Vault, a cloud SDK, a script) can feed skyfs:
+//! skyfs is a standalone daemon or sidecar and talks to no service but the
+//! bucket (and, for OIDC, the bucket's STS). A deployment gives it one of:
+//!
+//! - **OIDC workload identity** ([`WebIdentitySource`]): a token the
+//!   platform issues and rotates (a Kubernetes projected service-account
+//!   token, a SPIFFE JWT-SVID, a CI job token) exchanged at STS with
+//!   `AssumeRoleWithWebIdentity` for a credential valid for at most an
+//!   hour. No secret is stored anywhere. AWS S3 (EKS natively, or any
+//!   cluster whose issuer is public), MinIO, Ceph RGW and Backblaze B2
+//!   accept it.
+//! - **The platform's ambient identity**: EKS Pod Identity, ECS task roles,
+//!   EC2 instance roles, through the standard AWS chain.
+//! - **Static keys** ([`FileSource`] or the environment): for stores with
+//!   no identity federation (Cloudflare R2), scoped to one bucket by the
+//!   store's own token policy. A file is re-read, so a rotated Secret is
+//!   picked up without a restart.
+//!
+//! Every source yields an S3-style key triple with an optional expiry.
+//! Files use the AWS `credential_process` JSON format:
 //!
 //! ```json
 //! {"Version": 1, "AccessKeyId": "…", "SecretAccessKey": "…",
@@ -19,6 +32,7 @@
 //! into the local WAL, exactly as when the bucket is unreachable).
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -42,17 +56,17 @@ pub enum CredentialError {
     /// The credential document is malformed.
     #[error("malformed credential: {0}")]
     Malformed(String),
-    /// The credential command failed.
-    #[error("credential command failed: {0}")]
-    Command(String),
-    /// The broker refused or could not be reached.
-    #[error("credential broker: {0}")]
-    Broker(String),
-    /// Static keys were found where short-lived ones are required.
+    /// STS refused the token or could not be reached.
+    #[error("STS AssumeRoleWithWebIdentity: {0}")]
+    Sts(String),
+    /// A credential source is missing a setting.
+    #[error("credentials: {0}")]
+    Config(String),
+    /// Static keys were found where the platform identity was asked for.
     #[error(
-        "long-lived static keys found in the environment (AWS_ACCESS_KEY_ID without \
-         AWS_SESSION_TOKEN); use a short-lived credential source, or pass \
-         --allow-static-credentials for development"
+        "static keys found in the environment (AWS_ACCESS_KEY_ID without \
+         AWS_SESSION_TOKEN) with --credentials ambient; pass --credentials static \
+         to use them, or remove them to use the platform identity"
     )]
     StaticRefused,
 }
@@ -87,17 +101,16 @@ struct ProcessCredential {
     session_token: Option<String>,
     #[serde(default)]
     expiration: Option<String>,
-    /// skyfs broker extension: a single-use token for the next exchange.
-    #[serde(default)]
-    refresh_token: Option<String>,
+}
+
+fn parse_expiration(s: &str) -> Result<SystemTime, CredentialError> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(SystemTime::from)
+        .map_err(|e| CredentialError::Malformed(format!("Expiration {s:?}: {e}")))
 }
 
 /// Parses a `credential_process` JSON document.
 pub fn parse_credential(json: &[u8]) -> Result<ShortLived, CredentialError> {
-    parse_with_refresh(json).map(|(c, _)| c)
-}
-
-fn parse_with_refresh(json: &[u8]) -> Result<(ShortLived, Option<String>), CredentialError> {
     let c: ProcessCredential =
         serde_json::from_slice(json).map_err(|e| CredentialError::Malformed(e.to_string()))?;
     if c.version.is_some_and(|v| v != 1) {
@@ -106,25 +119,14 @@ fn parse_with_refresh(json: &[u8]) -> Result<(ShortLived, Option<String>), Crede
             c.version
         )));
     }
-    let expires_at = c
-        .expiration
-        .map(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s)
-                .map(SystemTime::from)
-                .map_err(|e| CredentialError::Malformed(format!("Expiration {s:?}: {e}")))
-        })
-        .transpose()?;
-    Ok((
-        ShortLived {
-            credential: Arc::new(AwsCredential {
-                key_id: c.access_key_id,
-                secret_key: c.secret_access_key,
-                token: c.session_token,
-            }),
-            expires_at,
-        },
-        c.refresh_token,
-    ))
+    Ok(ShortLived {
+        credential: Arc::new(AwsCredential {
+            key_id: c.access_key_id,
+            secret_key: c.secret_access_key,
+            token: c.session_token,
+        }),
+        expires_at: c.expiration.as_deref().map(parse_expiration).transpose()?,
+    })
 }
 
 /// Something that can produce a fresh credential.
@@ -134,9 +136,10 @@ pub trait Fetch: fmt::Debug + Send + Sync + 'static {
     async fn fetch(&self) -> Result<ShortLived, CredentialError>;
 }
 
-/// Reads a `credential_process` JSON file that an agent keeps fresh: a
-/// sidecar, Vault Agent, or a Kubernetes projected secret. Mount it on a
-/// tmpfs, readable only by the daemon.
+/// Reads a `credential_process` JSON file: static keys from a mounted
+/// Kubernetes Secret, or a short-lived credential an agent (Vault Agent, a
+/// sidecar) keeps fresh. Re-read on every refresh, so rotation needs no
+/// restart. Mount it on a tmpfs, readable only by the daemon.
 #[derive(Debug, Clone)]
 pub struct FileSource {
     path: PathBuf,
@@ -163,164 +166,228 @@ impl Fetch for FileSource {
     }
 }
 
-/// Runs a command that prints a `credential_process` JSON document, like
-/// the AWS CLI's `credential_process` setting.
-#[derive(Debug, Clone)]
-pub struct ProcessSource {
-    argv: Vec<String>,
+/// What a session policy allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// `GetObject` only.
+    ReadOnly,
+    /// Read, create and delete objects.
+    ReadWrite,
 }
 
-impl ProcessSource {
-    /// A source running `argv[0]` with the remaining arguments.
-    #[must_use]
-    pub fn new(argv: Vec<String>) -> Self {
-        Self { argv }
-    }
-}
-
-#[async_trait]
-impl Fetch for ProcessSource {
-    async fn fetch(&self) -> Result<ShortLived, CredentialError> {
-        let (cmd, args) = self
-            .argv
-            .split_first()
-            .ok_or_else(|| CredentialError::Command("empty command".into()))?;
-        let out = tokio::process::Command::new(cmd)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .map_err(|e| CredentialError::Command(format!("{cmd}: {e}")))?;
-        if !out.status.success() {
-            return Err(CredentialError::Command(format!(
-                "{cmd} exited with {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        parse_credential(&out.stdout)
-    }
-}
-
-/// Exchanges a workload identity token for a volume-scoped credential at
-/// the skyfs credential broker (design §10.1).
+/// An IAM session policy narrowing a role to one volume's objects.
 ///
-/// `POST {url}/v1/volumes/{volume_id}/credentials` with
-/// `Authorization: Bearer <token>` and body `{"writer_id", "access"}`;
-/// the response is a `credential_process` document.
+/// It bounds what this process can do with the credential (least
+/// privilege for the daemon, and read-only for a read-only mount); it is
+/// not a boundary against a compromised workload, which holds the identity
+/// token and could ask STS without it. Isolation between tenants comes from
+/// the role's own policy: one role per service account, allowed only its
+/// prefix. `s3:ListBucket` on the prefix makes a HEAD of a missing key
+/// answer 404 rather than 403; skyfs never lists on a correctness path.
+#[must_use]
+pub fn session_policy(bucket: &str, root: &str, access: Access) -> serde_json::Value {
+    let objects = match access {
+        Access::ReadOnly => serde_json::json!(["s3:GetObject"]),
+        Access::ReadWrite => serde_json::json!([
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:DeleteObject",
+            "s3:AbortMultipartUpload"
+        ]),
+    };
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": objects,
+                "Resource": format!("arn:aws:s3:::{bucket}/{root}/*"),
+            },
+            {
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": format!("arn:aws:s3:::{bucket}"),
+                "Condition": {"StringLike": {"s3:prefix": format!("{root}/*")}},
+            }
+        ]
+    })
+}
+
+/// OIDC workload identity: exchanges a JWT for a short-lived credential
+/// with STS `AssumeRoleWithWebIdentity`.
 ///
-/// The bearer token is, in order of preference:
-/// - the `RefreshToken` the broker returned last time: single-use,
-///   rotated on every exchange, held only in memory. It lets a container
-///   whose only proof of identity was a one-time mount token keep
-///   refreshing without any long-lived secret;
-/// - the token file, read on every exchange (Kubernetes rotates projected
-///   service-account tokens in place; an orchestrator may rewrite a mount
-///   token). Used first, and again whenever a refresh token is refused.
-pub struct BrokerSource {
-    url: String,
-    volume_id: String,
+/// The request is unsigned; the token is the proof. The token file is read
+/// on every exchange, because the platform rotates it in place (kubelet
+/// refreshes projected service-account tokens at 80% of their lifetime).
+/// The session is named after the mount's writer id, so the store's audit
+/// log (CloudTrail) shows which mount made each request.
+pub struct WebIdentitySource {
+    sts_endpoint: String,
+    role_arn: String,
     token_file: PathBuf,
-    writer_id: String,
-    read_only: bool,
+    session_name: String,
+    policy: Option<String>,
+    duration: Duration,
     http: reqwest::Client,
-    refresh: parking_lot::Mutex<Option<String>>,
 }
 
-impl fmt::Debug for BrokerSource {
+impl fmt::Debug for WebIdentitySource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BrokerSource")
-            .field("url", &self.url)
-            .field("volume_id", &self.volume_id)
+        f.debug_struct("WebIdentitySource")
+            .field("sts_endpoint", &self.sts_endpoint)
+            .field("role_arn", &self.role_arn)
             .field("token_file", &self.token_file)
+            .field("session_name", &self.session_name)
             .finish_non_exhaustive()
     }
 }
 
-impl BrokerSource {
-    /// A broker client for one volume (`volume_id` in hex).
+/// Lifetime asked of STS: an hour, the longest a role chain allows and the
+/// longest the design lets one credential live.
+pub const WEB_IDENTITY_DURATION: Duration = Duration::from_secs(3600);
+
+impl WebIdentitySource {
+    /// A source assuming `role_arn` at `sts_endpoint` with the token in
+    /// `token_file`, narrowed by `policy` (an IAM policy document) if given.
     #[must_use]
     pub fn new(
-        url: &str,
-        volume_id: String,
+        sts_endpoint: &str,
+        role_arn: String,
         token_file: PathBuf,
-        writer_id: String,
-        read_only: bool,
+        session_name: &str,
+        policy: Option<serde_json::Value>,
     ) -> Self {
         Self {
-            url: url.trim_end_matches('/').to_owned(),
-            volume_id,
+            sts_endpoint: sts_endpoint.trim_end_matches('/').to_owned(),
+            role_arn,
             token_file,
-            writer_id,
-            read_only,
+            session_name: session_name_from(session_name),
+            policy: policy.map(|p| p.to_string()),
+            duration: WEB_IDENTITY_DURATION,
             http: reqwest::Client::new(),
-            refresh: parking_lot::Mutex::new(None),
         }
     }
 
-    async fn exchange(
-        &self,
-        token: &str,
-    ) -> Result<(ShortLived, Option<String>), (bool, CredentialError)> {
-        let body = serde_json::json!({
-            "writer_id": self.writer_id,
-            "access": if self.read_only { "read-only" } else { "read-write" },
-        });
-        let resp = self
-            .http
-            .post(format!(
-                "{}/v1/volumes/{}/credentials",
-                self.url, self.volume_id
-            ))
-            .bearer_auth(token.trim())
-            .json(&body)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| (false, CredentialError::Broker(e.to_string())))?;
-        let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| (false, CredentialError::Broker(e.to_string())))?;
-        if !status.is_success() {
-            let unauthorized = status == reqwest::StatusCode::UNAUTHORIZED;
-            return Err((
-                unauthorized,
-                CredentialError::Broker(format!(
-                    "{status}: {}",
-                    String::from_utf8_lossy(&bytes).trim()
-                )),
-            ));
+    fn body(&self, token: &str) -> String {
+        let mut fields = vec![
+            ("Action", "AssumeRoleWithWebIdentity"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", self.role_arn.as_str()),
+            ("RoleSessionName", self.session_name.as_str()),
+            ("WebIdentityToken", token),
+        ];
+        let secs = self.duration.as_secs().to_string();
+        fields.push(("DurationSeconds", &secs));
+        if let Some(p) = &self.policy {
+            fields.push(("Policy", p));
         }
-        parse_with_refresh(&bytes).map_err(|e| (false, e))
+        fields
+            .iter()
+            .map(|(k, v)| format!("{k}={}", form_encode(v)))
+            .collect::<Vec<_>>()
+            .join("&")
     }
+}
 
-    async fn token_from_file(&self) -> Result<String, CredentialError> {
-        tokio::fs::read_to_string(&self.token_file)
+/// A valid `RoleSessionName` (`[\w+=,.@-]{2,64}`) from a writer id.
+fn session_name_from(writer_id: &str) -> String {
+    let mut s: String = writer_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "_+=,.@-".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    while s.len() < 2 {
+        s.push('-');
+    }
+    s
+}
+
+/// `application/x-www-form-urlencoded` encoding of one value.
+fn form_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// The text of `<tag>…</tag>` in an STS response, unescaped.
+fn xml_text(xml: &str, tag: &str) -> Option<String> {
+    let start = xml.find(&format!("<{tag}>"))? + tag.len() + 2;
+    let end = start + xml[start..].find(&format!("</{tag}>"))?;
+    Some(
+        xml[start..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Parses an STS `AssumeRole*` response.
+pub fn parse_sts_response(xml: &str) -> Result<ShortLived, CredentialError> {
+    let get = |t: &str| {
+        xml_text(xml, t)
+            .ok_or_else(|| CredentialError::Malformed(format!("STS response lacks {t}")))
+    };
+    Ok(ShortLived {
+        credential: Arc::new(AwsCredential {
+            key_id: get("AccessKeyId")?,
+            secret_key: get("SecretAccessKey")?,
+            token: Some(get("SessionToken")?),
+        }),
+        expires_at: Some(parse_expiration(&get("Expiration")?)?),
+    })
+}
+
+#[async_trait]
+impl Fetch for WebIdentitySource {
+    async fn fetch(&self) -> Result<ShortLived, CredentialError> {
+        let token = tokio::fs::read_to_string(&self.token_file)
             .await
             .map_err(|source| CredentialError::Read {
                 path: self.token_file.clone(),
                 source,
-            })
+            })?;
+        let resp = self
+            .http
+            .post(&self.sts_endpoint)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(self.body(token.trim()))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| CredentialError::Sts(e.to_string()))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| CredentialError::Sts(e.to_string()))?;
+        if !status.is_success() {
+            // The error document names the code and message, never the token.
+            let code = xml_text(&text, "Code").unwrap_or_default();
+            let message = xml_text(&text, "Message").unwrap_or_default();
+            return Err(CredentialError::Sts(format!("{status} {code}: {message}")));
+        }
+        parse_sts_response(&text)
     }
 }
 
 #[async_trait]
-impl Fetch for BrokerSource {
+impl<T: Fetch> Fetch for Arc<T> {
     async fn fetch(&self) -> Result<ShortLived, CredentialError> {
-        let held = self.refresh.lock().take();
-        let result = match held {
-            Some(t) => match self.exchange(&t).await {
-                // Refused (used, expired, revoked): fall back to the file.
-                Err((true, _)) => self.exchange(&self.token_from_file().await?).await,
-                other => other,
-            },
-            None => self.exchange(&self.token_from_file().await?).await,
-        };
-        let (cred, next) = result.map_err(|(_, e)| e)?;
-        *self.refresh.lock() = next;
-        Ok(cred)
+        (**self).fetch().await
     }
 }
 
@@ -335,8 +402,8 @@ pub struct Refreshing<F> {
 /// credential's lifetime, whichever is less).
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(300);
 
-/// Re-read sources that give no expiry this often, so a rotated file or
-/// broker credential is picked up.
+/// Re-read sources that give no expiry this often, so a rotated file is
+/// picked up.
 pub const UNDATED_REFRESH: Duration = Duration::from_secs(300);
 
 impl<F: Fetch> Refreshing<F> {
@@ -363,10 +430,10 @@ impl<F: Fetch> Refreshing<F> {
     pub async fn get(&self) -> Result<Arc<AwsCredential>, CredentialError> {
         let now = SystemTime::now();
         let mut guard = self.current.lock().await;
-        if let Some((cached, at)) = guard.as_ref() {
-            if Self::fresh(cached, *at, now) {
-                return Ok(cached.credential.clone());
-            }
+        if let Some((cached, at)) = guard.as_ref()
+            && Self::fresh(cached, *at, now)
+        {
+            return Ok(cached.credential.clone());
         }
         match self.source.fetch().await {
             Ok(fresh) => {
@@ -406,28 +473,39 @@ impl<F: Fetch> CredentialProvider for Refreshing<F> {
 /// Where a mount gets blob storage credentials.
 #[derive(Debug, Clone)]
 pub enum CredentialSource {
-    /// The platform's workload identity, through the standard AWS chain:
-    /// EKS IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE`), EKS Pod Identity and ECS
-    /// (`AWS_CONTAINER_CREDENTIALS_*`), EC2 instance roles. Static keys in
-    /// the environment are refused unless `allow_static`.
-    Ambient {
-        /// Accept `AWS_ACCESS_KEY_ID` without a session token (development).
-        allow_static: bool,
+    /// The platform's identity through the standard AWS chain: EKS Pod
+    /// Identity and ECS (`AWS_CONTAINER_CREDENTIALS_*`), EC2 instance roles,
+    /// IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE`). Static keys in the environment
+    /// are refused here, so they are never used by accident.
+    Ambient,
+    /// Static keys: from a `credential_process` JSON file (re-read, so a
+    /// rotated Secret is picked up), or from `AWS_ACCESS_KEY_ID`,
+    /// `AWS_SECRET_ACCESS_KEY` and optionally `AWS_SESSION_TOKEN`.
+    Static {
+        /// The file; `None` reads the environment.
+        file: Option<PathBuf>,
     },
-    /// A `credential_process` JSON file kept fresh by an agent.
-    File(PathBuf),
-    /// A command printing a `credential_process` JSON document.
-    Process(Vec<String>),
-    /// The skyfs credential broker, authenticated with a workload token.
-    Broker {
-        /// Broker base URL.
-        url: String,
-        /// File holding the bearer token (re-read on every exchange).
-        token_file: PathBuf,
-    },
+    /// OIDC workload identity: `AssumeRoleWithWebIdentity`.
+    WebIdentity(WebIdentityConfig),
 }
 
-/// Fails if the environment carries long-lived static keys.
+/// Settings for [`CredentialSource::WebIdentity`].
+#[derive(Debug, Clone)]
+pub struct WebIdentityConfig {
+    /// The role to assume (`AWS_ROLE_ARN`).
+    pub role_arn: String,
+    /// The OIDC token, re-read on every exchange
+    /// (`AWS_WEB_IDENTITY_TOKEN_FILE`).
+    pub token_file: PathBuf,
+    /// STS endpoint (`AWS_ENDPOINT_URL_STS`); default
+    /// `https://sts.<region>.amazonaws.com`.
+    pub sts_endpoint: Option<String>,
+    /// Narrow the credential to the volume's prefix with a session policy
+    /// (AWS; turn off for an STS that rejects `Policy`).
+    pub session_policy: bool,
+}
+
+/// Fails if the environment carries static keys.
 pub fn refuse_static_env() -> Result<(), CredentialError> {
     let has = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
     if has("AWS_ACCESS_KEY_ID") && !has("AWS_SESSION_TOKEN") {
@@ -453,7 +531,7 @@ mod tests {
         async fn fetch(&self) -> Result<ShortLived, CredentialError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n >= self.fail_after {
-                return Err(CredentialError::Broker("down".into()));
+                return Err(CredentialError::Sts("down".into()));
             }
             Ok(ShortLived {
                 credential: Arc::new(AwsCredential {
@@ -521,21 +599,21 @@ mod tests {
         assert!(r.get().await.is_err(), "expired and no refresh");
     }
 
-    /// A fake broker: answers each request with the next canned response,
-    /// recording the bearer token it was given.
-    async fn fake_broker(
+    /// A fake STS: answers each request with the next canned response and
+    /// returns the request bodies it was given.
+    async fn fake_sts(
         responses: Vec<(u16, String)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
-            let mut seen = Vec::new();
+            let mut bodies = Vec::new();
             for (status, body) in responses {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                let mut buf = vec![0u8; 8192];
+                let mut buf = vec![0u8; 16384];
                 let mut req = Vec::new();
-                loop {
+                let body_at = loop {
                     let n = sock.read(&mut buf).await.unwrap();
                     req.extend_from_slice(&buf[..n]);
                     let text = String::from_utf8_lossy(&req);
@@ -549,57 +627,134 @@ mod tests {
                             })
                             .unwrap_or(0);
                         if req.len() >= h + 4 + len {
-                            break;
+                            break h + 4;
                         }
                     }
-                }
-                let text = String::from_utf8_lossy(&req).into_owned();
-                let auth = text
-                    .lines()
-                    .find_map(|l| {
-                        l.strip_prefix("authorization: Bearer ")
-                            .or_else(|| l.strip_prefix("Authorization: Bearer "))
-                    })
-                    .unwrap_or("")
-                    .to_owned();
-                seen.push(auth);
+                };
+                bodies.push(String::from_utf8_lossy(&req[body_at..]).into_owned());
                 let reply = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\ncontent-type: text/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 sock.write_all(reply.as_bytes()).await.unwrap();
             }
-            seen
+            bodies
         });
         (url, task)
     }
 
+    fn sts_ok(key: &str) -> String {
+        format!(
+            "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials>\
+             <AccessKeyId>{key}</AccessKeyId><SecretAccessKey>s&amp;s</SecretAccessKey>\
+             <SessionToken>t</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration>\
+             </Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>"
+        )
+    }
+
+    fn form(body: &str) -> std::collections::HashMap<String, String> {
+        body.split('&')
+            .map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap();
+                let mut out = Vec::new();
+                let b = v.as_bytes();
+                let mut i = 0;
+                while i < b.len() {
+                    if b[i] == b'%' {
+                        out.push(u8::from_str_radix(&v[i + 1..i + 3], 16).unwrap());
+                        i += 3;
+                    } else {
+                        out.push(b[i]);
+                        i += 1;
+                    }
+                }
+                (k.to_owned(), String::from_utf8(out).unwrap())
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    async fn broker_rotates_refresh_tokens_and_falls_back_to_the_file() {
-        let cred = |id: &str, refresh: &str| {
-            format!(
-                r#"{{"AccessKeyId":"{id}","SecretAccessKey":"s","SessionToken":"t","RefreshToken":"{refresh}"}}"#
-            )
-        };
-        let (url, task) = fake_broker(vec![
-            (200, cred("a", "r1")),
-            (200, cred("b", "r2")),
-            (401, "refresh token revoked".into()),
-            (200, cred("c", "r3")),
+    async fn web_identity_exchanges_the_current_token_with_a_scoped_policy() {
+        let (url, task) = fake_sts(vec![
+            (200, sts_ok("k1")),
+            (
+                403,
+                "<ErrorResponse><Error><Code>InvalidIdentityToken</Code>\
+                 <Message>expired</Message></Error></ErrorResponse>"
+                    .into(),
+            ),
+            (200, sts_ok("k2")),
         ])
         .await;
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("token");
-        std::fs::write(&token, "mount-token\n").unwrap();
-        let b = BrokerSource::new(&url, "00".repeat(16), token, "w".into(), false);
-        assert_eq!(b.fetch().await.unwrap().credential.key_id, "a");
-        assert_eq!(b.fetch().await.unwrap().credential.key_id, "b");
-        // r2 is refused: the file token is used instead.
-        assert_eq!(b.fetch().await.unwrap().credential.key_id, "c");
-        assert_eq!(
-            task.await.unwrap(),
-            vec!["mount-token", "r1", "r2", "mount-token"]
+        std::fs::write(&token, "jwt-1\n").unwrap();
+        let policy = session_policy("b", "t/volumes/00", Access::ReadOnly);
+        let src = WebIdentitySource::new(
+            &url,
+            "arn:aws:iam::1:role/r".into(),
+            token.clone(),
+            "host/pod 1",
+            Some(policy.clone()),
         );
+        let c = src.fetch().await.unwrap();
+        assert_eq!(c.credential.key_id, "k1");
+        assert_eq!(c.credential.secret_key, "s&s");
+        assert!(c.expires_at.is_some());
+        let err = src.fetch().await.unwrap_err().to_string();
+        assert!(err.contains("InvalidIdentityToken: expired"), "{err}");
+        assert!(
+            !err.contains("jwt"),
+            "an error must not echo the token: {err}"
+        );
+        // The platform rotated the token: the next exchange uses the new one.
+        std::fs::write(&token, "jwt-2").unwrap();
+        assert_eq!(src.fetch().await.unwrap().credential.key_id, "k2");
+
+        let bodies = task.await.unwrap();
+        let first = form(&bodies[0]);
+        assert_eq!(first["Action"], "AssumeRoleWithWebIdentity");
+        assert_eq!(first["RoleArn"], "arn:aws:iam::1:role/r");
+        assert_eq!(first["RoleSessionName"], "host-pod-1");
+        assert_eq!(first["WebIdentityToken"], "jwt-1");
+        assert_eq!(first["DurationSeconds"], "3600");
+        let sent: serde_json::Value = serde_json::from_str(&first["Policy"]).unwrap();
+        assert_eq!(sent, policy);
+        assert_eq!(form(&bodies[2])["WebIdentityToken"], "jwt-2");
+    }
+
+    #[test]
+    fn session_policy_scopes_to_the_volume() {
+        let ro = session_policy("bkt", "t/volumes/ab", Access::ReadOnly);
+        assert_eq!(
+            ro["Statement"][0]["Action"],
+            serde_json::json!(["s3:GetObject"])
+        );
+        assert_eq!(
+            ro["Statement"][0]["Resource"],
+            "arn:aws:s3:::bkt/t/volumes/ab/*"
+        );
+        assert_eq!(
+            ro["Statement"][1]["Condition"]["StringLike"]["s3:prefix"],
+            "t/volumes/ab/*"
+        );
+        let rw = session_policy("bkt", "t/volumes/ab", Access::ReadWrite);
+        assert!(
+            rw["Statement"][0]["Action"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("s3:PutObject"))
+        );
+    }
+
+    #[test]
+    fn session_names_are_valid() {
+        assert_eq!(session_name_from("a"), "a-");
+        assert_eq!(
+            session_name_from("ip-10-0-0-1/skyfs:42"),
+            "ip-10-0-0-1-skyfs-42"
+        );
+        assert_eq!(session_name_from(&"x".repeat(100)).len(), 64);
     }
 
     #[tokio::test]

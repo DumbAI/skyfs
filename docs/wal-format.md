@@ -80,6 +80,11 @@ A reader accepts segment `seq` only if all hold; otherwise the mount fails:
   swap; nlinks of the parents change if directories cross parents.
 - `SetAttr.size` smaller than the current size drops extents beyond it;
   larger adds a hole.
+- A `Rename` within one directory keeps the entry's readdir cookie; a
+  rename across directories gives it the target's next cookie.
+- `SetAttr` sets ctime to the record's `time_ns` unless `ctime_ns` is
+  present. An access-time update (relatime, design §9) carries only
+  `atime_ns` and the inode's unchanged `ctime_ns`.
 - `Reclaim` requires nlink 0.
 
 ## Other objects (non-normative here; owned by `skyfs-store::Key`)

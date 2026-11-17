@@ -79,10 +79,10 @@ async fn commit(shared: &Arc<Shared>, seg: &Arc<Sealed>) -> Outcome {
     // Data before reference: every blob this segment points at is uploaded.
     for dep in &seg.blob_deps {
         let rx = shared.uploads.lock().get(dep).cloned();
-        if let Some(mut rx) = rx {
-            if rx.wait_for(|done| *done).await.is_err() {
-                return Outcome::Aborted;
-            }
+        if let Some(mut rx) = rx
+            && rx.wait_for(|done| *done).await.is_err()
+        {
+            return Outcome::Aborted;
         }
     }
     let seg2 = seg.clone();

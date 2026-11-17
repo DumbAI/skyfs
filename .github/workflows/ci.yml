@@ -12,7 +12,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.92
         with:
           components: rustfmt, clippy
@@ -26,7 +26,7 @@ jobs:
   fuse:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.92
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y fuse3 attr
@@ -37,9 +37,27 @@ jobs:
   pjdfstest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.92
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y fuse3 autoconf automake gcc make
       - run: cargo build -p skyfs
       - run: sudo env PATH="$PWD/target/debug:$PATH" scripts/pjdfstest.sh
+
+  # The generic xfstests `quick` group through mount(8) and
+  # scripts/mount.fuse.skyfs; exclusions are justified in
+  # scripts/xfstests.exclude.
+  xfstests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 attr acl xfslibs-dev uuid-dev libtool-bin e2fsprogs \
+            automake gcc make libacl1-dev libaio-dev xfsprogs libgdbm-dev gawk fio uuid-runtime \
+            python3 sqlite3 libcap2-bin bc psmisc libattr1-dev liburing-dev libinih-dev quota
+      - run: cargo build --release -p skyfs
+      - run: sudo env PATH="$PWD/target/release:$PATH" scripts/xfstests.sh -g quick

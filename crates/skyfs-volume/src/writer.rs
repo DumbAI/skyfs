@@ -33,6 +33,11 @@ pub struct CommitState {
     pub committed: Option<u64>,
     /// Another writer took the volume; nothing more will commit.
     pub fenced: bool,
+    /// The mount was abandoned (process exit, or an operator giving up on
+    /// an unmount the bucket cannot complete). Nothing more will commit
+    /// from this process; the local WAL stays for the next mount on this
+    /// disk.
+    pub aborted: bool,
 }
 
 /// A sequential write run on one inode, to route large writes to blobs.
@@ -203,6 +208,8 @@ pub struct Shared {
     pub abort: AtomicBool,
     /// The engine's runtime, for spawning from FUSE threads.
     pub rt: tokio::runtime::Handle,
+    /// Held while mounted: this process owns the local directory.
+    pub local_lock: File,
 }
 
 /// Retry delays for bucket operations that must eventually succeed.
@@ -225,13 +232,22 @@ impl Shared {
     }
 
     fn writable(&self, st: &State) -> Result<(), Errno> {
-        if st.broken || self.commit_state().fenced {
+        let c = self.commit_state();
+        if st.broken || c.fenced || c.aborted {
             return Err(Errno::EIO);
         }
-        if st.closing {
+        if st.closing || self.cfg.read_only {
             return Err(Errno::EROFS);
         }
         Ok(())
+    }
+
+    /// Abandons the mount: retry loops stop at their next failure, and
+    /// every waiter and later mutation fails with EIO now.
+    pub fn abort(&self) {
+        self.abort.store(true, Ordering::SeqCst);
+        self.commit.send_modify(|c| c.aborted = true);
+        self.kick.notify_one();
     }
 
     /// Fails unless mutations are accepted.
@@ -512,7 +528,7 @@ impl Shared {
             if c.committed.is_some_and(|s| s >= seq) {
                 return Ok(());
             }
-            if c.fenced {
+            if c.fenced || c.aborted {
                 return Err(Errno::EIO);
             }
             if rx.changed().await.is_err() {

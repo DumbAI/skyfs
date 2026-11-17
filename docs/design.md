@@ -23,10 +23,11 @@ snapshot in the background, at shutdown as far as it can, and the next
 container resumes from the pointer. The log only ever holds the last few
 minutes of changes, so replaying it at mount takes seconds.
 
-A container never holds a long-lived storage key. It holds one credential
-at a time, scoped to its volume's prefix and valid for at most an hour,
-obtained from the platform's workload identity or from the skyfs
-credential broker and refreshed in place (§10.1).
+skyfs is a standalone daemon (or sidecar) and depends on no service but
+the bucket. It authenticates with OIDC workload identity, exchanging a
+platform-issued token for a credential valid for at most an hour and
+narrowed to its volume, or, for stores without identity federation, with
+static keys from a mounted secret (§10.1).
 
 ```
 ┌─────────────────────────── container (or its host) ───────────────────────────┐
@@ -76,7 +77,7 @@ journal every 30–60 s.
 | R3 | Met | — |
 | R4 | Met | — |
 | R5 | Met for committed files; files written this session were visible only locally | Met in substance |
-| R6 | Met (lease, conditional commits) | — |
+| R6 | Met (conditional commits) | — |
 | R7 | **Not met.** The journal was a batch of `path → hash` for closed files, every 30–60 s | Not a WAL of operations. No synchronous mode. Open files, appends, in-place edits, renames and directory changes reached blob storage only as their end state, if at all. App state needed a second mechanism (SQLite snapshots). |
 | R8 | **Not met.** The schema could express "this path has this content" and whiteouts | No hard links, directory renames, partial writes, truncate, xattrs, special files, ownership, or open-but-unlinked files. |
 
@@ -266,6 +267,18 @@ seals; closing starts its upload, and that segment's PUT waits for it.
 Sealing closes blobs so that replication lag stays bounded by `max-lag`
 plus one blob upload.
 
+**Slow links.** Every bucket request must finish within
+`--request-timeout` (default 5 min), body included, or it is retried from
+the start. A fixed timeout and fixed parallelism together set the slowest
+uplink that still makes progress: in-flight bytes ÷ timeout. Blobs go up
+in 8 MiB parts, two per blob and `blob_uploads` (4) blobs at once, at most
+64 MiB in flight, so the floor is about 2 Mbit/s. More parallelism would
+not be faster on a slow link, only worse: every part would share the link,
+none would finish within the timeout, and the upload would retry forever.
+A failed multipart upload is aborted before its retry, so its parts are
+not left behind. Still, give the bucket a lifecycle rule that aborts
+incomplete multipart uploads after a day, for daemons killed mid-upload.
+
 ### 6.4 Replication modes (R7)
 
 The mode is chosen per mount (`--replication sync|async`). Both write the
@@ -302,8 +315,8 @@ group-commit window.
 
 ### 6.5 Single writer and fencing (R6)
 
-R6 is enforced out of band by a lease (control plane) and in band by the log
-itself, so a lease bug cannot fork the volume:
+R6 is enforced in band, by the log itself, so nothing outside the bucket
+can fork the volume:
 
 1. On mount, the writer finds the head (§7.2) and appends a `MountBegin`
    record with `epoch = previous + 1` as the first record of the next seq.
@@ -315,7 +328,16 @@ itself, so a lease bug cannot fork the volume:
    land a later seq after losing an earlier one.
 
 A clean unmount drains the log, commits `MountEnd`, restores as far as it
-can within a time budget (§7.4), and only then releases the lease.
+can within a time budget (§7.4).
+
+Fencing makes two writers *safe*, not useful: each new mount fences the
+previous one, whose writes then fail with `EIO`. Running one mount per
+volume is the deployment's job, and it is a job orchestrators already do:
+a StatefulSet (or a Deployment with the `Recreate` strategy) of one
+replica, a systemd unit, a scheduler that places the volume once. skyfs
+deliberately runs no lease service of its own; one would have to be
+available for every mount and still could not replace the fence, since a
+paused process can outlive any lease.
 
 ### 6.6 Recovery after a crash
 
@@ -401,6 +423,16 @@ produce the same snapshot.
 | Unrestored segments | 512 |
 | Clean shutdown | always, best effort (§7.4) |
 
+A pass folds **at most 256 segments** (`restore_batch`) and publishes a
+snapshot; a longer backlog (a long tail replayed at mount, a slow
+uplink, a restorer that was off) continues with the next pass at once.
+Each step is durable, so a mount that ends early, or a shutdown restore
+that runs out of time, keeps the progress it made instead of abandoning
+one oversized pass forever. The shutdown restore also retries transient
+bucket errors until its deadline. xfstests found this: short-lived mounts
+of a volume with a 1,300-segment tail never finished a pass, so the tail
+and every mount's replay grew without bound.
+
 Passes run at low priority with a bandwidth cap, so they never compete with
 the app for the network. **Cost:** each pass rewrites the whole metadata
 file, which is ~10 MB at 10⁵ inodes, so a pass every few minutes is cheap.
@@ -417,7 +449,7 @@ a pure function of committed segments.
 
 ### 7.3 Mount: snapshot, then the tail
 
-1. Acquire the lease. Read `volume.json` (hint only).
+1. Read `volume.json` (hint only).
 2. Find the latest snapshot: `HEAD snapshots/<g>.manifest` forward from the
    hint until `404`. Download the manifest and its metadata (megabytes for
    ~10⁵ files). It seeds both the live store and the restore replica.
@@ -451,12 +483,12 @@ a pure function of committed segments.
    `--restore-on-exit-timeout` (default 60 s) expires. On timeout the pass
    in flight is abandoned: nothing half-done is visible, because the
    manifest is written last.
-3. Update the `volume.json` hint, release the lease, exit.
+3. Update the `volume.json` hint, exit.
 
 If the container is killed during step 2, nothing is lost. The log is
 complete, and the next container replays a longer tail, then restores it
 in the background. Between mounts the tail can only stay the same, since
-no one writes; an offline restore job (the same code with the lease held)
+no one writes; an offline restore job (the same code, mounted as the writer)
 can shorten it for volumes left with a long tail.
 
 **Scale limit:** mount time is the snapshot metadata download plus the tail
@@ -594,7 +626,8 @@ packs and rewrite sparse packs (§7.2). The log itself is never rewritten.
 | `fsync`, `fdatasync`, `syncfs`, `sync` | none | durability point (§6.4) |
 | `read`, `readdir`, `stat`, `open` without create/trunc, `access` | none | |
 | `flock`, `fcntl` locks, leases | none | local to the single mount; POSIX locks never survive a crash |
-| atime | `SetAttr{atime}` | `relatime` semantics, coalesced into the next segment |
+| `open_by_handle_at`, NFS export | none | handles stay valid across inode eviction and remounts: inode numbers are never reused, and `lookup(ino, ".")` finds any live inode |
+| atime | `SetAttr{atime, ctime unchanged}` | `--atime relatime` (default), `noatime` or `strictatime`. Recorded at open for reading, read, `readdir` and `readlink`: the kernel serves cached reads without asking skyfs, so the open is where a read is sure to be seen; the daemon then invalidates the kernel's cached attributes. Rides in the next segment; nobody waits for it |
 | `inotify`/`fanotify` | none | the kernel raises events for changes made through the mount, the only writer |
 
 ### 9.1 What mountpoint-s3 cannot do, and how skyfs logs and replays it
@@ -686,6 +719,17 @@ goes through the daemon, and device nodes are inert under `nodev`.
 | Unprivileged container, privileged host (Kubernetes, our own VMs) | skyfs runs on the host or in a privileged sidecar; the mount is bind-propagated into the app container. Later a CSI driver. |
 | No `/dev/fuse` at all (RunPod pods) | No mount possible. A degraded "sync a directory" mode can reuse the same log format; out of scope for v1. |
 
+`mount -t fuse.skyfs VOLUME_ID DIR -o store=...` and `/etc/fstab` work
+through `scripts/mount.fuse.skyfs` (installed as `/sbin/mount.fuse.skyfs`):
+it maps `key=value` options onto `skyfs mount` flags, detaches the daemon
+and returns once the mount is up. `mount -o remount,ro|rw` changes the
+existing mount's flags (a bind remount: FUSE refuses superblock
+reconfiguration). `-o ro` / `--read-only` mounts serve the volume as of
+mount time and write nothing: no epoch, no log, no restore. A daemon holds an exclusive lock on its
+cache directory, and a second one waits for it (a remount racing the
+previous unmount). Device nodes and set-id bits are ignored unless the
+mount asks for `--dev`/`--suid`, as for any FUSE mount.
+
 The daemon runs as root (or with `CAP_CHOWN`/`CAP_FOWNER`) so ownership is
 real. Permission checks use the kernel's `default_permissions`, plus ACLs.
 uid/gid are stored numerically; containers with user namespaces see the
@@ -693,138 +737,112 @@ mapped ids.
 
 ### 10.1 Authentication and credentials
 
-A container that mounts skyfs needs to read and write its volume in blob
-storage. The usual answer, an access key pair in environment variables,
-is the wrong one: the key never expires, it usually grants the whole
-bucket, it leaks through `docker inspect`, `/proc/<pid>/environ`, child
-processes, crash dumps and image layers, and rotating it means touching
-every deployment.
+A mount reads and writes its volume in blob storage, so it needs a
+credential. skyfs is a library and a standalone daemon or sidecar: it
+talks to the bucket and, for OIDC, to the bucket's STS, and to nothing
+else. There is no skyfs control plane.
 
 **Requirements.**
 
 | # | Requirement |
 |---|---|
-| C1 | No long-lived secret in the container, its image or its environment. Whatever is there expires within an hour. |
-| C2 | Least privilege: a credential reaches one volume's prefix only, read-only for read-only mounts. |
-| C3 | One mechanism on every target: AWS (EKS, EC2), GPU clouds without a cloud IAM (Lambda, Hyperstack, DigitalOcean), any Kubernetes, and both S3 and R2. |
-| C4 | Refresh in place: a mount runs for days without remounting. |
-| C5 | Revocable within one credential lifetime, and tied to the single-writer lease (R6). |
-| C6 | Attributable: every credential names its volume and writer. |
-| C7 | Storage access is never on the data path of a third service: a broker outage must not stop reads or writes for at least one credential lifetime. |
+| C1 | No skyfs service to run: a mount needs only the bucket (and its STS), so nothing else can stop it. |
+| C2 | Prefer no stored secret at all: an identity the platform issues and rotates, exchanged for a credential that expires within an hour. |
+| C3 | Least privilege: the daemon's credential reaches one volume's prefix, read-only for read-only mounts, where the store can express it. |
+| C4 | Refresh in place: a mount runs for days without remounting; a rotated secret is picked up without a restart. |
+| C5 | Attributable: the store's audit log names the mount. |
+| C6 | Works on S3 and on stores without identity federation (R2). |
+
+**What the stores offer** (November 2026).
+
+| Store | Federation | Short-lived credential without a stored secret |
+|---|---|---|
+| AWS S3 | STS `AssumeRoleWithWebIdentity` trusts any OIDC issuer registered as an IAM identity provider: EKS natively; any other Kubernetes cluster whose service-account issuer and JWKS are publicly reachable (e.g. published to a bucket); GitHub Actions; SPIFFE/SPIRE JWT-SVIDs. EKS Pod Identity, ECS task roles and instance roles through the AWS chain. | Yes |
+| MinIO, Ceph RGW, SeaweedFS | `AssumeRoleWithWebIdentity` at their own STS endpoint | Yes |
+| Backblaze B2 | OIDC workload identity at its STS | Yes |
+| Cloudflare R2 | None. Temporary credentials exist, but are minted from a parent API token, which is itself a stored secret | No: static, bucket-scoped API token |
 
 **Options.**
 
-| Option | How | For | Against | Verdict |
-|---|---|---|---|---|
-| A. Static keys (env, secret mount) | IAM user / R2 API token per deployment | simplest | fails C1, C4, C5; usually C2 | Rejected; `--allow-static-credentials` for development only |
-| B. Cloud workload identity | EKS IRSA / Pod Identity, ECS task roles, EC2 instance roles: `AssumeRoleWithWebIdentity` by the SDK chain | no secret at all; standard | AWS and S3 only (R2 has no STS federation); scope is per role, not per volume, unless one role per volume | **Supported** (`--credentials ambient`) for AWS-native deployments |
-| C. Credential broker | the container proves its identity to the skyfs control plane, which mints a short-lived, prefix-scoped credential (S3: STS `AssumeRole` with a session policy; R2: temporary access credentials) | meets C1–C7 everywhere; one story for S3 and R2; the broker is also the natural lease holder | a service to run; it holds the parent keys | **Chosen as the default** |
-| D. Presigned URLs | the broker signs each request | the container holds nothing reusable | the broker is on the data path (fails C7); conditional-PUT headers must be signed in; one round trip per object | Rejected |
-| E. Host daemon or sidecar | skyfs runs on the host or a privileged sidecar (§10); the app container gets only the mount | the app never sees any credential | needs a privileged host | **Recommended where available**; the host daemon itself uses B or C |
-| F. External secret agents | Vault Agent, SPIFFE helpers, cloud SDKs render or print credentials | reuse what a platform already runs | one more agent | **Supported** through `--credentials file` and `process` |
+| Option | For | Against | Verdict |
+|---|---|---|---|
+| A. OIDC workload identity, exchanged by skyfs (`--credentials oidc`) | no secret anywhere; the platform rotates the token; skyfs adds a per-volume session policy and names the session | needs a federated store and a public issuer | **Preferred** |
+| B. The platform's ambient identity (`--credentials ambient`) | no secret; EKS Pod Identity, ECS, EC2 need nothing else | AWS only; scope is the role's | **Supported** |
+| C. Static keys from a mounted secret (`--credentials static`) | works everywhere, including R2 | a stored secret; rotation is the operator's job | **Supported**, for stores without federation; scope the key to one bucket (an R2 token can be) |
+| D. A skyfs credential broker and lease service | one story for R2 and S3, per-volume R2 tokens | a service every mount depends on (fails C1); it holds parent keys; the single-writer lease it offered is already enforced in band (§6.5) | **Rejected** (built, then removed) |
+| E. Presigned URLs | the container holds nothing reusable | a signer on the data path; conditional-PUT headers must be signed in | Rejected |
 
-**Design.** One interface in `skyfs-store`: a refreshing provider plugged
-into the S3 client as its credential source. It caches one credential,
-fetches the next when less than min(5 min, ¼ of its lifetime) remains,
-and on a failed refresh keeps the current one until it truly expires.
-Every source speaks the AWS `credential_process` JSON format
-(`AccessKeyId`, `SecretAccessKey`, `SessionToken`, `Expiration`), so any
-tool that can produce it plugs in:
+Running skyfs on the host or in a privileged sidecar (§10) composes with
+all of them: the application container receives the mount and no
+credential.
+
+**Design.** One interface in `skyfs-store::credentials`: a refreshing
+provider plugged into the S3 client. It caches one credential, fetches
+the next when less than min(5 min, ¼ of its lifetime) remains (undated
+ones every 5 minutes), and on a failed refresh keeps the current one
+until it truly expires.
 
 | `--credentials` | Source | Typical deployment |
 |---|---|---|
-| `ambient` (default) | the AWS chain: IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE`), EKS Pod Identity / ECS (`AWS_CONTAINER_CREDENTIALS_*`), instance roles. Refuses `AWS_ACCESS_KEY_ID` without `AWS_SESSION_TOKEN` | EKS or EC2 with S3 |
-| `broker` | the skyfs credential broker, authenticated with a workload token | everything else; the default for R2 |
-| `file` | a `credential_process` JSON file an agent keeps fresh (tmpfs, mode 0400) | Vault Agent, a sidecar, a host agent |
-| `process` | a command that prints `credential_process` JSON | site-specific tooling |
+| `oidc` | `AssumeRoleWithWebIdentity` with the token in `--web-identity-token-file`, re-read on every exchange; `--role-arn`; `--sts-endpoint` for non-AWS STS. The flags default to `AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ENDPOINT_URL_STS`, which the EKS webhook already injects | Kubernetes anywhere with S3, MinIO, Ceph, B2 |
+| `ambient` (default) | the AWS chain: EKS Pod Identity / ECS (`AWS_CONTAINER_CREDENTIALS_*`), IRSA, instance roles. Refuses `AWS_ACCESS_KEY_ID` without a session token, so static keys are never used by accident | EKS, ECS, EC2 |
+| `static` | `--credentials-file`, AWS `credential_process` JSON, re-read so a rotated Kubernetes Secret is picked up; or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | R2; development |
 
-**Identity proof.** The broker never sees a long-lived secret from the
-container either. The container presents one of:
-
-- **Kubernetes:** a projected service-account token with audience
-  `skyfs`, expiring in 10 minutes and rotated in place by the kubelet. The
-  broker verifies it against the cluster's OIDC keys and maps
-  `(namespace, service account)` to the volumes it may mount.
-- **Containers started by our orchestrator** (Docker on GPU VMs): a
-  **one-time mount token**, a JWT the control plane signs when it grants
-  the lease: `{volume_id, access, writer_id, lease_id, exp ≤ 10 min, jti}`.
-  It is written to a tmpfs file, never an environment variable, and is
-  accepted for one exchange (`jti`).
-
-Each response may carry a **`RefreshToken`**: single-use, rotated on every
-exchange, bound to the lease, and held only in the daemon's memory. The
-daemon presents it on the next refresh, and falls back to the token file
-if it is refused. A container whose only proof was a one-time token can
-therefore refresh for as long as it holds the lease, and a copied refresh
-token is useless after its first use. A restarted daemon needs a new
-mount token, which the orchestrator issues with the new lease anyway.
-
-**Broker protocol.**
+**OIDC exchange.** The request is unsigned; the JWT is the proof:
 
 ```
-POST {broker}/v1/volumes/{volume_id}/credentials
-Authorization: Bearer <projected SA token | mount token | refresh token>
-{"writer_id": "...", "access": "read-write" | "read-only"}
-
-200 {"Version": 1, "AccessKeyId": "...", "SecretAccessKey": "...",
-     "SessionToken": "...", "Expiration": "<RFC 3339>", "RefreshToken": "..."}
-401 token invalid, expired, reused or revoked
-409 the volume's write lease is held by another writer
+POST https://sts.<region>.amazonaws.com/
+Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=...
+&RoleSessionName=<writer id>&WebIdentityToken=<JWT>&DurationSeconds=3600
+&Policy=<session policy>
 ```
 
-**Scoping, per store.** The broker holds the only parent credentials.
+On Kubernetes the token is a projected service-account token with the
+audience the IAM identity provider expects (`sts.amazonaws.com`),
+rotated in place by the kubelet. The role's trust policy pins the
+issuer, the audience and the `sub` claim
+(`system:serviceaccount:<namespace>:<name>`), so only that service
+account can assume it.
 
-- **S3:** `sts:AssumeRole` on a role that may touch only volume prefixes,
-  with `DurationSeconds` ≤ 3600 and a session policy narrowing it to one
-  volume:
-  ```json
-  {"Version": "2012-10-17", "Statement": [
-    {"Effect": "Allow",
-     "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
-     "Resource": "arn:aws:s3:::BUCKET/PREFIX/volumes/VOLUME_ID/*"},
-    {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::BUCKET",
-     "Condition": {"StringLike": {"s3:prefix": "PREFIX/volumes/VOLUME_ID/*"}}}]}
-  ```
-  `s3:ListBucket` on the prefix is required even though skyfs never
-  lists on a correctness path: without it, S3 answers `HEAD` of a
-  missing key with 403 instead of 404, and head probing (§7.3) cannot
-  tell "absent" from "forbidden". Read-only mounts get `GetObject` and
-  `ListBucket` only.
-- **R2:** Cloudflare's temporary access credentials,
-  `POST /accounts/{account}/r2/temp-access-credentials` with
-  `{bucket, parentAccessKeyId, permission: "object-read-write" | "object-read-only",
-  ttlSeconds: 3600, prefixes: ["PREFIX/volumes/VOLUME_ID/"]}`, returning an
-  S3-compatible key triple with a session token.
+**Session policy.** Unless `--no-session-policy` (for an STS that rejects
+`Policy`), skyfs narrows each credential to its volume:
 
-**Lease coupling (C5, R6).** The broker issues read-write credentials only
-to the current lease holder, and renewing the credential renews the lease.
-Revoking a writer means refusing its next refresh: its credential dies
-within an hour, and until then the in-band fence (§6.5) already prevents
-it from committing anything once a new writer has mounted. Revocation
-never depends on the old container cooperating.
+```json
+{"Version": "2012-10-17", "Statement": [
+  {"Effect": "Allow",
+   "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+   "Resource": "arn:aws:s3:::BUCKET/PREFIX/volumes/VOLUME_ID/*"},
+  {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::BUCKET",
+   "Condition": {"StringLike": {"s3:prefix": "PREFIX/volumes/VOLUME_ID/*"}}}]}
+```
+
+Read-only mounts, `fsck` and `info` get `GetObject` and `ListBucket` only.
+`s3:ListBucket` on the prefix is required even though skyfs never lists
+on a correctness path: without it, S3 answers `HEAD` of a missing key
+with 403 instead of 404, and head probing (§7.3) cannot tell "absent"
+from "forbidden". The session policy bounds what the *daemon* can do,
+which limits the damage of a bug; it is not a boundary against a
+compromised workload, which holds the token and can call STS without it.
+Isolation between tenants is the role's policy: one role per service
+account, allowed only that tenant's prefix.
 
 **Inside the container.** Credentials live in the daemon's memory only and
-are never logged (debug output shows the key id). Token files sit on a
-tmpfs readable only by the daemon. When skyfs runs on the host or in a
-sidecar (§10), the app container receives the mount and nothing else.
+are never logged (debug output shows the key id; an STS error shows its
+code and message, never the token). Token and key files sit on a tmpfs
+readable only by the daemon.
 
 **Failure behaviour.** A refresh failure keeps the current credential
 until it expires. After that, object requests fail and the existing retry
 loops take over, exactly as when the bucket is unreachable (§11): writes
 continue into the local WAL until `wal/` is full, cached reads keep
-working, and sync-mode durability points wait. A broker outage shorter
-than the credential lifetime is invisible (C7).
+working, and sync-mode durability points wait. An STS outage shorter than
+the credential lifetime is invisible.
 
-**What an attacker gets** by stealing everything in the container: one
-volume's prefix, for at most an hour, and no way to extend it (the refresh
-token is single-use and the mount token already spent). A stolen projected
-service-account token is bound to the `skyfs` audience and expires in
-minutes.
-
-**Implemented here:** the refreshing provider, the four sources, the
-refresh-token rotation and the static-key refusal (`skyfs-store::credentials`),
-and the CLI flags. **Not here:** the broker service and the lease, which
-belong to the control plane; the protocol above is their contract.
+**What an attacker gets** by stealing everything in the container. With
+`oidc`: the current credential (one volume, at most an hour) and the
+token (minutes of validity, one audience), so the role's permissions
+until the token expires. With `static`: the key, until an operator
+rotates it, which is why `static` is for stores without federation.
 
 ## 11. Guarantees and failure cases
 
@@ -840,8 +858,14 @@ belong to the control plane; the protocol above is their contract.
 | Killed during a restore pass or the shutdown restore | Nothing lost; the pointer stays at the last manifest; the next mount replays a longer tail and resumes restoring |
 | Restorer falls behind (offline, slow uplink) | Still correct: mount replays a longer tail. The tail length is exported as a metric |
 | Snapshot from another history (restored volume, bug) | `prev_digest` of segment `restored_seq + 1` ≠ `restored_digest`; mount refused |
+| Uplink slower than about 2 Mbit/s | Uploads time out and retry without progress; raise `--request-timeout` (§6.3) |
 | Blob storage unreachable | Cached reads work; uncached reads `EIO`; writes continue locally until `wal/` is full, then block; sync-mode durability points block |
-| Credential refresh fails (broker down) | The current credential is used until it expires (≤ 1 h); then as "blob storage unreachable" |
+| Credential refresh fails (STS down, token file missing) | The current credential is used until it expires (≤ 1 h); then as "blob storage unreachable" |
+| Bucket unreachable at mount | Mount fails after `mount_timeout` (5 min) if `MountBegin` cannot commit; nothing is claimed |
+| Bucket unreachable at unmount | The unmount waits; a second SIGINT/SIGTERM abandons it, keeping the local WAL for the next mount on this disk |
+| A PUT lands but its response is lost | Segments, packs and snapshot metadata are compared or content-addressed; a manifest is retried byte for byte, so the retry recognises its own object |
+| Power loss tears the local WAL | Recovery keeps the prefix of records whose frames, inline bytes and blob chunks all verify |
+| Two daemons on one cache directory | The second waits for the first's lock (`local_lock_wait`), then fails |
 | A segment deleted from the middle of the log | Mount refused: the head probe would stop at the hole, so it checks the hint and the next 16 seqs (§7.3) |
 
 ## 12. Build order and what settles the open questions
@@ -876,12 +900,48 @@ thin FUSE adapter.
    **pjdfstest passes in full** (238 files, 8,798 tests; `scripts/pjdfstest.sh`,
    run in CI). The kernel does not enforce `NAME_MAX` for FUSE, so
    `lookup` returns `ENAMETOOLONG` itself.
-7. **Open:** fault injection at every step of commit, mount, restore and
-   shutdown; the generic xfstests; the
-   credential broker and lease service (control plane); an offline LIST
-   sweep for crash orphans; `atime` updates (mounts behave as `noatime`);
-   FUSE writeback cache and passthrough; POSIX ACL enforcement
-   (`FUSE_POSIX_ACL`; ACL xattrs are stored but not enforced).
+7. **Fault injection. Done** (`crates/skyfs-volume/tests/faults.rs`,
+   `skyfs_store::faults`). A fault-injecting bucket numbers every
+   mutation (PUT, multipart completion, DELETE) and injects one fault at
+   the k-th: a transient failure, a lost response, or a crash just
+   before or just after it lands. A fixed workload (inline and blob
+   writes, patches, truncation, renames, unlink, restore passes with GC)
+   runs once per k and fault. Oracle: transient faults and lost
+   responses change nothing (clean, fully restored unmount, exact final
+   state); after a crash, another machine sees the state after a prefix
+   of the operations that includes every `fsync`ed one, and the same
+   disk recovers every operation. Two more enumerations crash the
+   recovery mount at each of its mutations, and tear the newest local
+   segment, its data and a blob at every byte near the end. Every
+   volume passes fsck. It found and fixed: a lost manifest response
+   stopping the restorer as if fenced; one transient error ending the
+   unmount restore; a failed read during repack treated as corruption;
+   torn blobs accepted by WAL recovery; mount waiting forever for an
+   unreachable bucket.
+8. **Credentials without a control plane. Done** (§10.1): OIDC workload
+   identity exchanged by skyfs with a per-volume session policy, the
+   platform's ambient identity, and static keys from a re-read secret.
+   A credential broker and lease service were built first and removed:
+   a service every mount depends on, holding parent keys, to provide a
+   lease the log's fence already makes unnecessary for safety.
+9. **xfstests. Done** (`scripts/xfstests.sh`, the generic `quick` group,
+   650 tests, through `mount -t fuse.skyfs`, in CI). The first runs found
+   and fixed: restore passes that never finished on short-lived mounts
+   (now bounded batches); `readdir` running forever while a program
+   renames what it lists (a rename within a directory now keeps the
+   entry's cookie); stale file handles (`open_by_handle_at`, NFS export:
+   export support and `lookup(ino, ".")`); `fallocate` beyond the
+   reported capacity; atime missing for reads served from the page cache;
+   read-only mounts and remounts; `nodev` blocking device-node tests. The
+   12 exclusions, each with its reason, are in `scripts/xfstests.exclude`:
+   ACLs, the kernel's old S_ISGID rule for FUSE, two behaviours of the
+   test kernel to re-check elsewhere, and the single-writer rule.
+10. **Read-only mounts. Done** (`--read-only`, `-o ro`): snapshot plus
+    tail as of mount time, no epoch claimed, nothing written, read-only
+    credentials, the local WAL left for the next read-write mount.
+11. **Open:** an offline LIST sweep for crash orphans;
+    FUSE writeback cache and passthrough; POSIX ACL enforcement
+    (`FUSE_POSIX_ACL`; ACL xattrs are stored but not enforced).
 
 Benchmark before step 4 ships:
 

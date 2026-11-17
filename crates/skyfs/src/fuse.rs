@@ -34,7 +34,14 @@ struct SkyFs {
     vol: Arc<Volume>,
     rt: tokio::runtime::Handle,
     destroyed: Arc<tokio::sync::Notify>,
+    /// Tells the kernel its cached attributes are stale (set once mounted).
+    notifier: Arc<std::sync::OnceLock<fuser::Notifier>>,
 }
+
+/// `FS_IOC_FSGETXATTR`: `_IOR('X', 31, struct fsxattr)`.
+const FS_IOC_FSGETXATTR: u32 = 0x801c_581f;
+/// `FS_IOC_GETFLAGS`: `_IOR('f', 1, long)`.
+const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
 
 fn errno(e: Errno) -> fuser::Errno {
     fuser::Errno::from_i32(e.0)
@@ -154,7 +161,14 @@ impl Filesystem for SkyFs {
         let _ = config.set_max_write(1 << 20);
         let _ = config.set_max_readahead(4 << 20);
         let _ = config.set_time_granularity(Duration::from_nanos(1));
-        let _ = config.add_capabilities(InitFlags::FUSE_ASYNC_READ | InitFlags::FUSE_BIG_WRITES);
+        // Export support: file handles (NFS export, open_by_handle_at)
+        // stay valid after the kernel drops an inode, because skyfs inode
+        // numbers are never reused and `lookup(ino, ".")` finds any inode.
+        let _ = config.add_capabilities(
+            InitFlags::FUSE_ASYNC_READ
+                | InitFlags::FUSE_BIG_WRITES
+                | InitFlags::FUSE_EXPORT_SUPPORT,
+        );
         Ok(())
     }
 
@@ -334,12 +348,20 @@ impl Filesystem for SkyFs {
         self.entry(self.vol.link(ino.0, newparent.0, newname.as_bytes()), reply);
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        // Reads may never reach skyfs (page cache), so an open for reading
+        // is where atime is kept.
+        let reading = flags.0 & libc::O_ACCMODE != libc::O_WRONLY;
+        let moved = reading && self.vol.access(ino.0).unwrap_or(false);
         match self.vol.open(ino.0) {
             // Objects are immutable and this mount is the only writer, so
             // the page cache stays valid across opens.
             Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE),
-            Err(e) => reply.error(errno(e)),
+            Err(e) => return reply.error(errno(e)),
+        }
+        if moved && let Some(n) = self.notifier.get() {
+            // Attributes only (offset < 0): the cached atime is stale.
+            let _ = n.inval_inode(ino, -1, 0);
         }
     }
 
@@ -500,18 +522,15 @@ impl Filesystem for SkyFs {
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         const BLOCK: u64 = 4096;
-        const TOTAL_BLOCKS: u64 = 1 << 40; // blob storage: report a large, fixed capacity
-        const TOTAL_FILES: u64 = 1 << 40;
         match self.vol.statfs() {
             Ok(s) => {
-                let used = s.bytes.div_ceil(BLOCK);
-                let free = TOTAL_BLOCKS.saturating_sub(used);
+                let free = s.free() / BLOCK;
                 reply.statfs(
-                    TOTAL_BLOCKS,
+                    s.capacity / BLOCK,
                     free,
                     free,
-                    TOTAL_FILES,
-                    TOTAL_FILES - s.inodes,
+                    s.max_inodes,
+                    s.max_inodes.saturating_sub(s.inodes),
                     4096,
                     255,
                     4096,
@@ -652,6 +671,31 @@ impl Filesystem for SkyFs {
             fuser::ReplyWrite::error,
         );
     }
+
+    /// Inode flags as `lsattr` and `xfs_io stat` ask for them: skyfs has
+    /// none (no immutable, append-only, project quota or extent hints).
+    fn ioctl(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _flags: fuser::IoctlFlags,
+        cmd: u32,
+        _in_data: &[u8],
+        out_size: u32,
+        reply: fuser::ReplyIoctl,
+    ) {
+        if let Err(e) = self.vol.getattr(ino.0) {
+            return reply.error(errno(e));
+        }
+        let len = match cmd {
+            FS_IOC_FSGETXATTR => 28,
+            FS_IOC_GETFLAGS => 8,
+            _ => return reply.error(fuser::Errno::ENOTTY),
+        };
+        let zeros = [0u8; 28];
+        reply.ioctl(0, &zeros[..len.min(out_size as usize)]);
+    }
 }
 
 fn xattr_reply(reply: ReplyXattr, value: &[u8], size: u32) {
@@ -662,6 +706,23 @@ fn xattr_reply(reply: ReplyXattr, value: &[u8], size: u32) {
         reply.error(fuser::Errno::ERANGE);
     } else {
         reply.data(value);
+    }
+}
+
+/// Resolves at the next SIGINT or SIGTERM.
+async fn signalled() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let terminated = async {
+        match term.as_mut() {
+            Some(t) => {
+                t.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = terminated => {}
     }
 }
 
@@ -685,23 +746,50 @@ pub fn serve(
         "volume mounted"
     );
     let destroyed = Arc::new(tokio::sync::Notify::new());
+    let notifier = Arc::new(std::sync::OnceLock::new());
     let fs = SkyFs {
         vol: vol.clone(),
         rt: vol.runtime(),
         destroyed: destroyed.clone(),
+        notifier: notifier.clone(),
     };
     let mut config = Config::default();
     config.mount_options = vec![
-        MountOption::FSName("skyfs".into()),
-        MountOption::Subtype("skyfs".into()),
+        MountOption::FSName(args.fsname.clone()),
         MountOption::DefaultPermissions,
     ];
+    if !args.subtype.is_empty() {
+        config
+            .mount_options
+            .push(MountOption::Subtype(args.subtype.clone()));
+    }
+    if args.read_only {
+        // The kernel refuses writes itself, before they reach skyfs.
+        config.mount_options.push(MountOption::RO);
+    }
+    if args.atime == crate::cli::AtimeArg::Noatime {
+        // The kernel then also skips invalidating cached atimes after reads.
+        config.mount_options.push(MountOption::NoAtime);
+    }
+    // Device nodes and set-id binaries from a network volume are a host
+    // risk: off unless asked for, as for any unprivileged FUSE mount.
+    config.mount_options.push(if args.dev {
+        MountOption::Dev
+    } else {
+        MountOption::NoDev
+    });
+    config.mount_options.push(if args.suid {
+        MountOption::Suid
+    } else {
+        MountOption::NoSuid
+    });
     if args.allow_other {
         config.acl = SessionACL::All;
     }
     config.n_threads = Some(args.threads.max(1));
     let session =
         fuser::spawn_mount(fs, &args.mountpoint, &config).map_err(|e| format!("mount: {e}"))?;
+    let _ = notifier.set(session.notifier());
     tracing::info!(mountpoint = %args.mountpoint.display(), "serving");
 
     let waiter = tokio::runtime::Builder::new_current_thread()
@@ -709,19 +797,8 @@ pub fn serve(
         .build()
         .map_err(|e| e.to_string())?;
     let by_kernel = waiter.block_on(async {
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-        let terminated = async {
-            match term.as_mut() {
-                Some(t) => {
-                    t.recv().await;
-                }
-                None => std::future::pending::<()>().await,
-            }
-        };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => { tracing::info!("interrupted; unmounting"); false }
-            () = terminated => { tracing::info!("terminated; unmounting"); false }
+            () = signalled() => { tracing::info!("signalled; unmounting"); false }
             () = destroyed.notified() => { tracing::info!("unmounted by the kernel"); true }
         }
     });
@@ -736,6 +813,20 @@ pub fn serve(
     ended.map_err(|e| format!("unmounting {}: {e}", args.mountpoint.display()))?;
 
     let vol = Arc::into_inner(vol).ok_or("volume still referenced after unmount")?;
+    // The unmount waits for the bucket; a second signal gives up on it.
+    let abort = vol.abort_handle();
+    std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(signalled());
+            tracing::warn!(
+                "signalled again: abandoning the unmount; the local WAL is kept for the next mount on this disk"
+            );
+            abort.abort();
+        }
+    });
     let report = vol.unmount().map_err(|e| e.to_string())?;
     tracing::info!(
         head = report.head_seq,
