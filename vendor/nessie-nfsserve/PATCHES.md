@@ -17,3 +17,7 @@ skyfs uses it as the NFSv3 wire layer of the macOS transport
    page was listed forever by a client that pages with READDIR (Linux does,
    after its first READDIRPLUS). It now calls `readdir(dirid, cookie, n)`.
    Found by `scripts/nfs-smoke.sh` on Linux (a 201-entry directory).
+   Reported upstream:
+   <https://github.com/Gilamonster-Foundation/nessie-store/issues/171>,
+   fix proposed in
+   <https://github.com/Gilamonster-Foundation/nessie-store/pull/172>.

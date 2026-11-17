@@ -26,12 +26,14 @@ pub enum Command {
         /// Largest write stored inline in a log segment.
         #[arg(long, default_value_t = 1 << 20)]
         inline_data_max: u32,
-        /// Root directory owner uid.
-        #[arg(long, default_value_t = 0)]
-        root_uid: u32,
-        /// Root directory group gid.
-        #[arg(long, default_value_t = 0)]
-        root_gid: u32,
+        /// Root directory owner uid. Default: root on Linux, where the
+        /// daemon runs as root for containers; on macOS, the user running
+        /// `create`, who also runs the mount.
+        #[arg(long)]
+        root_uid: Option<u32>,
+        /// Root directory group gid (default as for `--root-uid`).
+        #[arg(long)]
+        root_gid: Option<u32>,
     },
     /// Mount a volume with FUSE (Linux) and serve until unmounted or signalled.
     Mount(MountArgs),
@@ -248,6 +250,20 @@ impl StoreArgs {
     }
 }
 
+/// The owner of a new volume's root directory when `--root-uid` /
+/// `--root-gid` are not given: root on Linux, the current user on macOS.
+#[must_use]
+pub fn default_root_owner() -> (u32, u32) {
+    if cfg!(target_os = "macos") {
+        (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        )
+    } else {
+        (0, 0)
+    }
+}
+
 /// Parses `250ms`, `30s`, `5m`, `2h`, `7d`.
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -293,6 +309,17 @@ mod tests {
         let id = parse_volume_id("000102030405060708090a0b0c0d0e0f").unwrap();
         assert_eq!(id[15], 15);
         assert!(parse_volume_id("xyz").is_err());
+    }
+
+    #[test]
+    fn root_owner_defaults_to_root_on_linux_and_the_user_on_macos() {
+        let (uid, gid) = default_root_owner();
+        if cfg!(target_os = "macos") {
+            assert_eq!(uid, rustix::process::geteuid().as_raw());
+            assert_eq!(gid, rustix::process::getegid().as_raw());
+        } else {
+            assert_eq!((uid, gid), (0, 0));
+        }
     }
 
     #[test]

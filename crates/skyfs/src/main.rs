@@ -53,10 +53,11 @@ fn run(cli: Cli) -> Result<()> {
             };
             let c = client(&store, id, "skyfs-create", false)?;
             let scratch = std::env::temp_dir().join(format!("skyfs-create-{}", hex(&id)));
+            let (uid, gid) = cli::default_root_owner();
             let opts = CreateOptions {
                 inline_data_max,
-                root_uid,
-                root_gid,
+                root_uid: root_uid.unwrap_or(uid),
+                root_gid: root_gid.unwrap_or(gid),
                 ..CreateOptions::default()
             };
             skyfs_volume::create_volume(&c, id, &opts, &scratch).map_err(|e| e.to_string())?;

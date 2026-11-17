@@ -64,10 +64,13 @@ skyfs mount --store s3://bucket/tenant --volume <id> --cache-dir ~/.cache/skyfs 
 On macOS `skyfs mount` serves the volume over NFSv3 on `127.0.0.1` and
 mounts it with the system's `mount_nfs`: as your user, with no kernel
 extension, macFUSE or anything else to install (`--transport nfs`, the
-default there). `umount ~/skyfs` or Ctrl-C unmounts. It is a single-user
+default there). `umount ~/skyfs` or Ctrl-C unmounts. On macOS
+`skyfs create` makes the volume's root directory yours (on Linux, root's;
+`--root-uid`/`--root-gid` override). It is a single-user
 transport: no xattrs, device nodes or FIFOs, and `--fsync` defaults to
 `local` because the NFS client commits at every close
-([design §10.2](docs/design.md#102-macos-the-nfs-transport)).
+([design §10.2](docs/design.md#102-macos-the-nfs-transport); how-to:
+[docs/macos.md](docs/macos.md)).
 
 Access times follow `--atime relatime` (default), `noatime` or
 `strictatime`. `--read-only` (`-o ro`) serves the volume as of mount time
@@ -132,6 +135,7 @@ container holds no credentials at all.
 |---|---|
 | [docs/design.md](docs/design.md) | Requirements, review of the previous design, alternatives, architecture, credentials, guarantees, build order |
 | [docs/wal-format.md](docs/wal-format.md) | The log format, normative |
+| [docs/macos.md](docs/macos.md) | Mounting on macOS: setup, S3 credentials, limits, troubleshooting |
 | [docs/testing.md](docs/testing.md) | Test layers, failure injection, kernel and real-bucket suites, coverage and gaps |
 | [proto/skyfs/wal/v1/wal.proto](proto/skyfs/wal/v1/wal.proto) | The log schema, source of truth |
 | [proto/skyfs/snapshot/v1/snapshot.proto](proto/skyfs/snapshot/v1/snapshot.proto) | The snapshot manifest (restore pointer) |
