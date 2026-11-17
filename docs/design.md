@@ -887,13 +887,17 @@ vendored fork of Hugging Face's `nfsserve`, with one fix:
 | Mount | NFSv3 over TCP, hard, `intr`, `locallocks` (locks stay in the kernel: one writer), 1 MiB `rsize`/`wsize`, `deadtimeout=60` (a dead daemon's mount is removed after a minute instead of hanging Finder), `nodev`, `nosuid`. |
 | Identity | Creates take the caller's uid/gid from AUTH_UNIX; symlinks and other credential-less creates get the daemon's user. Permissions are not enforced between users: it is a single-user transport for a laptop. Any local process can reach the port. |
 | Locks | `flock` and `fcntl` locks work between processes on the Mac: the kernel keeps them (`locallocks`), which is right for a single writer. |
-| Not supported | xattrs (not in NFSv3; macOS keeps them in `._` files), device nodes and FIFOs (no MKNOD), `fallocate` and `copy_file_range` (not in NFSv3; the client emulates copies). |
+| xattrs | NFSv3 has none, so the macOS client keeps a file's xattrs in an AppleDouble `._name` sibling, and gives nearly every file one (`com.apple.provenance`). The server stores siblings like any file but leaves them out of listings: the client finds them by name, and tree walkers (uv's cache, `git`, `ls`) would trip over them. `rmdir` clears leftovers. Refusing them is no option: macOS turns any failure to create one into EPERM, which `cp` and `copyfile` treat as fatal. |
+| Not supported | device nodes and FIFOs (no MKNOD), `fallocate` and `copy_file_range` (not in NFSv3; the client emulates copies). |
 
 Measured on an Apple Silicon MacBook (release build, local bucket): 512 MiB
 sequential write 1.2 GB/s, cold read on an empty cache 1.4 GB/s, 2000
 1 KiB files created in 4.4 s (2.2 ms each), `ls -l` of them 0.2 s, `git
-add` and `commit` of them 3 s. Against S3 (us-east-2) the mount takes
-2.8 s and a remount on an empty cache 2.6 s.
+add` and `commit` of them 3 s. `uv pip install numpy pandas requests rich`
+(3,824 files) into a venv on the mount: 22.9 s with uv's cache on APFS
+(each file copied, about 100 RPCs per file from the client's `copyfile`),
+2.4 s with the cache on the same volume (hard links). Against S3
+(us-east-2) the mount takes 2.8 s and a remount on an empty cache 2.6 s.
 
 ## 11. Guarantees and failure cases
 

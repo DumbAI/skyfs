@@ -302,14 +302,35 @@ pub struct SkyNfs {
     /// The first 8 bytes of the volume id: the `fsid`, and the prefix of
     /// every file handle.
     fsid: [u8; 8],
-    read_only: bool,
+    opts: NfsOptions,
+}
+
+/// How the NFS server behaves.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NfsOptions {
+    /// Serve read-only.
+    pub read_only: bool,
+}
+
+/// Whether `name` is an AppleDouble sibling (`._name`).
+///
+/// NFSv3 has no extended attributes, so the macOS client keeps a file's
+/// xattrs in a `._name` sibling it manages itself, and macOS gives nearly
+/// every file one (`com.apple.provenance`). The client finds a sibling by
+/// name, never by listing, so listings leave them out: tools that walk a
+/// tree (uv's cache, `git`, `ls`) would otherwise trip over them (uv tries
+/// to hard-link them: EPERM). Refusing them is no option: macOS turns any
+/// failure to create one into EPERM on the xattr write, which `cp` and
+/// `copyfile` treat as fatal.
+fn is_apple_double(name: &[u8]) -> bool {
+    name.starts_with(b"._")
 }
 
 impl SkyNfs {
     /// Serves `vol` (`volume_id` scopes its file handles), writing through
     /// `writers`.
     #[must_use]
-    pub fn new(writers: Arc<Writers>, volume_id: &[u8; 16], read_only: bool) -> Self {
+    pub fn new(writers: Arc<Writers>, volume_id: &[u8; 16], opts: NfsOptions) -> Self {
         let mut fsid = [0u8; 8];
         fsid.copy_from_slice(&volume_id[..8]);
         let owner = Caller {
@@ -321,7 +342,7 @@ impl SkyNfs {
             writers,
             owner,
             fsid,
-            read_only,
+            opts,
         }
     }
 
@@ -345,6 +366,32 @@ impl SkyNfs {
         blocking(|| self.vol.getattr(ino))
             .map(|a| self.attr(&a))
             .map_err(stale)
+    }
+
+    /// Removes `dir`'s entries if every one is an AppleDouble sibling;
+    /// whether it did (the directory is then empty).
+    fn clear_siblings(&self, dir: Ino) -> Result<bool, nfsstat3> {
+        let mut names = Vec::new();
+        let mut after = 2;
+        loop {
+            let (batch, _) = self.vol.readdir(dir, after, 1024).map_err(status)?;
+            let last = batch.len() < 1024;
+            for e in batch {
+                if !is_apple_double(&e.name) || e.kind == Kind::Directory {
+                    return Ok(false);
+                }
+                after = e.cookie;
+                names.push(e.name);
+            }
+            if last {
+                break;
+            }
+        }
+        for n in &names {
+            let done = self.vol.remove(dir, n, false).map_err(status)?;
+            self.vol.finish(done).map_err(status)?;
+        }
+        Ok(true)
     }
 
     fn name(n: &filename3) -> &[u8] {
@@ -401,7 +448,7 @@ fn cred(c: &UnixCred) -> Caller {
 #[async_trait]
 impl NFSFileSystem for SkyNfs {
     fn capabilities(&self) -> VFSCapabilities {
-        if self.read_only {
+        if self.opts.read_only {
             VFSCapabilities::ReadOnly
         } else {
             VFSCapabilities::ReadWrite
@@ -565,8 +612,18 @@ impl NFSFileSystem for SkyNfs {
         let a = blocking(|| self.vol.lookup(dirid, name)).map_err(status)?;
         // Our handle would keep an unlinked inode alive until it idles out.
         blocking(|| self.writers.release(a.ino));
-        let done =
-            blocking(|| self.vol.remove(dirid, name, a.kind == Kind::Directory)).map_err(status)?;
+        let is_dir = a.kind == Kind::Directory;
+        let done = match blocking(|| self.vol.remove(dirid, name, is_dir)) {
+            // A directory holding only hidden AppleDouble siblings looks
+            // empty to the client: clear them, then remove it.
+            Err(e)
+                if is_dir && e == Errno::ENOTEMPTY && blocking(|| self.clear_siblings(a.ino))? =>
+            {
+                blocking(|| self.vol.remove(dirid, name, true))
+            }
+            r => r,
+        }
+        .map_err(status)?;
         self.finish(done).await
     }
 
@@ -602,13 +659,28 @@ impl NFSFileSystem for SkyNfs {
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
         // skyfs cookies are stable and start at 3; 0 starts the listing.
-        // One extra entry tells whether this page is the last.
+        // AppleDouble siblings are left out ([`is_apple_double`]), so read
+        // until there is one visible entry past the page, or no more.
         let limit = max_entries.max(1);
         blocking(|| {
-            let (entries, _parent) = self.vol.readdir(dirid, start_after.max(2), limit + 1)?;
-            let end = entries.len() <= limit;
-            let mut out = Vec::with_capacity(entries.len().min(limit));
-            for e in entries.into_iter().take(limit) {
+            let mut visible = Vec::with_capacity(limit + 1);
+            let mut after = start_after.max(2);
+            loop {
+                let (batch, _parent) = self.vol.readdir(dirid, after, limit + 1)?;
+                let exhausted = batch.len() <= limit;
+                for e in batch {
+                    after = e.cookie;
+                    if !is_apple_double(&e.name) {
+                        visible.push(e);
+                    }
+                }
+                if exhausted || visible.len() > limit {
+                    break;
+                }
+            }
+            let end = visible.len() <= limit;
+            let mut out = Vec::with_capacity(visible.len().min(limit));
+            for e in visible.into_iter().take(limit) {
                 let a = self.vol.getattr(e.ino)?;
                 out.push(DirEntry {
                     fileid: e.ino,
@@ -822,7 +894,7 @@ pub fn serve(
         .build()
         .map_err(|e| e.to_string())?;
     let writers = Arc::new(Writers::new(vol.clone()));
-    let fs = SkyNfs::new(writers.clone(), &volume_id, read_only);
+    let fs = SkyNfs::new(writers.clone(), &volume_id, NfsOptions { read_only });
     let dir = args.mountpoint.clone();
     let served = rt.block_on(async {
         let listener = NFSTcpListener::bind("127.0.0.1:0", fs)
@@ -962,7 +1034,8 @@ mod tests {
             let client = self.client();
             let vol = blocking(|| Volume::mount(client, VID, cfg)).unwrap();
             let writers = Arc::new(Writers::new(Arc::new(vol)));
-            (SkyNfs::new(writers.clone(), &VID, read_only), writers)
+            let opts = NfsOptions { read_only };
+            (SkyNfs::new(writers.clone(), &VID, opts), writers)
         }
     }
 
@@ -1145,6 +1218,67 @@ mod tests {
             fs.fh_to_id(&short),
             Err(nfsstat3::NFS3ERR_BADHANDLE)
         ));
+        unmount(fs, w);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apple_double_siblings_are_stored_but_not_listed() {
+        let mut f = Fixture::new();
+        let (fs, w) = f.mount(false);
+        // Pages of visible entries with runs of hidden siblings between them.
+        for i in 0..20 {
+            fs.create(ROOT_INO, &name(&format!("f{i}")), mode(0o644))
+                .await
+                .unwrap();
+            for j in 0..3 {
+                fs.create(ROOT_INO, &name(&format!("._f{i}-{j}")), mode(0o644))
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut got = Vec::new();
+        let mut cookie = 0;
+        loop {
+            let page = fs.readdir(ROOT_INO, cookie, 4).await.unwrap();
+            assert!(page.entries.len() <= 4);
+            assert!(
+                !page.entries.is_empty() || page.end,
+                "an empty page must be the last"
+            );
+            for e in &page.entries {
+                got.push(String::from_utf8(e.name.0.clone()).unwrap());
+                cookie = e.cookie;
+            }
+            if page.end {
+                break;
+            }
+        }
+        got.sort();
+        let mut want: Vec<String> = (0..20).map(|i| format!("f{i}")).collect();
+        want.sort();
+        assert_eq!(got, want, "every visible entry once, no sibling");
+        // The client still reaches a sibling by name.
+        assert!(fs.lookup(ROOT_INO, &name("._f3-1")).await.is_ok());
+        unmount(fs, w);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rmdir_clears_leftover_siblings() {
+        let mut f = Fixture::new();
+        let (fs, w) = f.mount(false);
+        let (d, _) = fs.mkdir(ROOT_INO, &name("d")).await.unwrap();
+        fs.create(d, &name("._gone"), mode(0o644)).await.unwrap();
+        // Looks empty to the client, so rmdir must succeed.
+        fs.remove(ROOT_INO, &name("d")).await.unwrap();
+        // A real entry still keeps a directory.
+        let (d, _) = fs.mkdir(ROOT_INO, &name("e")).await.unwrap();
+        fs.create(d, &name("._x"), mode(0o644)).await.unwrap();
+        fs.create(d, &name("real"), mode(0o644)).await.unwrap();
+        assert!(matches!(
+            fs.remove(ROOT_INO, &name("e")).await,
+            Err(nfsstat3::NFS3ERR_NOTEMPTY)
+        ));
+        assert!(fs.lookup(d, &name("._x")).await.is_ok(), "nothing removed");
         unmount(fs, w);
     }
 

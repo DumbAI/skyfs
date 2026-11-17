@@ -267,6 +267,8 @@ on an in-memory bucket, no kernel or client involved:
 | `namespace_operations` | mkdir, hard and symbolic links, rename over a file, chmod/truncate/utimes, errno → NFS status |
 | `file_handles_are_scoped_to_the_volume` | a handle from another volume is STALE, a short one BADHANDLE |
 | `a_read_only_mount_says_so` | read-only capability and ROFS |
+| `apple_double_siblings_are_stored_but_not_listed` | `._` siblings are stored and found by name, never listed; pages of visible entries stay exact across runs of hidden ones |
+| `rmdir_clears_leftover_siblings` | a directory holding only hidden siblings removes; one with a real entry stays |
 | `conversions` | time, device-number and status conversions |
 
 **Through the kernel** (`scripts/nfs-smoke.sh`). The same story as
@@ -283,6 +285,13 @@ It found:
   with READDIR after its first READDIRPLUS, listed a 201-entry directory
   forever. Patched in `vendor/nessie-nfsserve` (`PATCHES.md`); macOS only
   uses READDIRPLUS, which was correct.
+- **`uv pip install` was slow and its cache failed.** Profiling showed two
+  causes. The NFS library swept its whole duplicate-request cache (about
+  180,000 entries at load) on every RPC under a global lock, so each RPC
+  grew from 90 µs to 360 µs (patched: `PATCHES.md` 2); and macOS's hidden
+  AppleDouble `._` siblings were listed, so uv tried to hard-link them
+  (EPERM). Siblings are now stored but not listed. numpy, pandas, requests
+  and rich: 145 s → 22.9 s; with uv's cache on the volume 2.4 s.
 - **Every close cost 28 ms on macOS.** The NFS client commits at each
   close, and the local WAL sync used `F_FULLFSYNC` (Rust's `sync_data` on
   macOS). Syncing as the platform's `fsync(2)` does (design §6.2) took 2000

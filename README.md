@@ -67,7 +67,8 @@ extension, macFUSE or anything else to install (`--transport nfs`, the
 default there). `umount ~/skyfs` or Ctrl-C unmounts. On macOS
 `skyfs create` makes the volume's root directory yours (on Linux, root's;
 `--root-uid`/`--root-gid` override). It is a single-user
-transport: no xattrs, device nodes or FIFOs, and `--fsync` defaults to
+transport: no device nodes or FIFOs, xattrs live in hidden `._` files,
+and `--fsync` defaults to
 `local` because the NFS client commits at every close
 ([design §10.2](docs/design.md#102-macos-the-nfs-transport); how-to:
 [docs/macos.md](docs/macos.md)).

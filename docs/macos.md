@@ -70,7 +70,15 @@ the same file format, add `--endpoint https://<account>.r2.cloudflarestorage.com
 
 ## Using it
 
-It is an ordinary folder: Finder, the terminal, editors, `git`.
+It is an ordinary folder: Finder, the terminal, editors, `git`, `uv`.
+
+- **Python environments.** `uv` installs by hard-linking from its cache,
+  which is on another filesystem (`~/.cache/uv`), so it copies instead and
+  warns ("Failed to hardlink files"). Either silence that with
+  `UV_LINK_MODE=copy`, or keep the cache on the volume,
+  `export UV_CACHE_DIR=~/skyfs/.uv-cache`: installs then hard-link (numpy,
+  pandas and friends, 3,824 files: 2.4 s instead of 23 s), and the cache
+  is part of the volume, uploaded like everything else.
 
 - **Durability.** On macOS's NFS client every `close`, as well as every
   `fsync`, is a durability point. With `--fsync local` (the default for this
@@ -91,7 +99,7 @@ It is an ordinary folder: Finder, the terminal, editors, `git`.
 
 | What | Why |
 |---|---|
-| `._name` files next to some files | NFSv3 has no extended attributes; macOS keeps them (quarantine, tags, provenance) in these AppleDouble files. Harmless. |
+| Extended attributes live in hidden `._name` files | NFSv3 has none, so macOS keeps them (quarantine, tags, provenance) in AppleDouble siblings. skyfs stores them but leaves them out of listings, so `ls`, Finder and tools don't see them; `xattr` and `cp` work. Every new file costs a second, hidden one. |
 | No device nodes or FIFOs (`mkfifo`) | The NFS server makes none. |
 | Permissions are not enforced between users | A single-user transport: files are created as the calling user, and any local process can reach the port. |
 | A volume mounts in one place at a time | skyfs is single-writer. |
