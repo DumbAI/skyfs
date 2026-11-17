@@ -5,14 +5,29 @@ use std::time::{Duration, SystemTime};
 /// `TransactionTracker` tracks the state of transactions to detect retransmissions.
 pub struct TransactionTracker {
     retention_period: Duration,
-    transactions: Mutex<HashMap<(u32, String), TransactionState>>,
+    transactions: Mutex<Transactions>,
 }
+
+/// skyfs patch: expired entries are swept at most once per
+/// [`HOUSEKEEPING_INTERVAL`]. Upstream swept the whole map on every request
+/// while holding the lock: with a 60 s retention a busy client keeps about
+/// 180,000 entries, so every RPC scanned them all, serialized.
+struct Transactions {
+    map: HashMap<(u32, String), TransactionState>,
+    last_housekeeping: SystemTime,
+}
+
+/// How often expired transactions are swept.
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(1);
 
 impl TransactionTracker {
     pub fn new(retention_period: Duration) -> Self {
         Self {
             retention_period,
-            transactions: Mutex::new(HashMap::new()),
+            transactions: Mutex::new(Transactions {
+                map: HashMap::new(),
+                last_housekeeping: SystemTime::now(),
+            }),
         }
     }
 
@@ -26,8 +41,15 @@ impl TransactionTracker {
             .transactions
             .lock()
             .expect("unable to unlock transactions mutex");
-        housekeeping(&mut transactions, self.retention_period);
-        if let hash_map::Entry::Vacant(e) = transactions.entry(key) {
+        let now = SystemTime::now();
+        if now
+            .duration_since(transactions.last_housekeeping)
+            .map_or(true, |d| d >= HOUSEKEEPING_INTERVAL)
+        {
+            housekeeping(&mut transactions.map, self.retention_period);
+            transactions.last_housekeeping = now;
+        }
+        if let hash_map::Entry::Vacant(e) = transactions.map.entry(key) {
             e.insert(TransactionState::InProgress);
             false
         } else {
@@ -43,7 +65,7 @@ impl TransactionTracker {
             .transactions
             .lock()
             .expect("unable to unlock transactions mutex");
-        if let Some(tx) = transactions.get_mut(&key) {
+        if let Some(tx) = transactions.map.get_mut(&key) {
             *tx = TransactionState::Completed(completion_time);
         }
     }

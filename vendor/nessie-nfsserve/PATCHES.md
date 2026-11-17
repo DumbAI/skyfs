@@ -21,3 +21,12 @@ skyfs uses it as the NFSv3 wire layer of the macOS transport
    <https://github.com/Gilamonster-Foundation/nessie-store/issues/171>,
    fix proposed in
    <https://github.com/Gilamonster-Foundation/nessie-store/pull/172>.
+
+2. **Duplicate-request cache scanned on every request**
+   (`src/transaction_tracker.rs`). `is_retransmission` swept the whole map
+   of recent transactions (retained 60 s) on every RPC, under the lock that
+   serializes all RPCs. A busy client keeps about 180,000 entries, so each
+   RPC scanned them all, and the server slowed as a workload went on
+   (90 µs per RPC at the start of `uv pip install`, 360 µs later). Now swept
+   at most once per second. Found profiling `uv pip install` over the macOS
+   transport. Hugging Face's `nfsserve` has the same code.

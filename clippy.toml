@@ -1,1 +1,1 @@
-doc-valid-idents = ["SQLite", "BLAKE3", "CRC32C", "SQLite's", "FUSE", "CloudTrail", "MinIO", ".."]
+doc-valid-idents = ["SQLite", "BLAKE3", "CRC32C", "SQLite's", "FUSE", "CloudTrail", "MinIO", "AppleDouble", "NFSv3", ".."]
