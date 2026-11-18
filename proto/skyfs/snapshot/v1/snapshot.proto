@@ -27,8 +27,9 @@ message SnapshotManifest {
   uint64 restored_epoch = 7;      // epoch of segment restored_seq
 
   // The metadata file: zstd-compressed SQLite with inodes, dirents, xattrs
-  // and extents. Extents point only at blobs/ and packs/, never at segments,
-  // so segments up to restored_seq are not needed to read this state.
+  // and extents. Extents point only at blobs/ and packs/ (this volume's, or
+  // a sealed base volume's), never at segments, so segments up to
+  // restored_seq are not needed to read this state.
   string meta_key = 8;            // snapshots/<gen:020>-<meta_blake3 hex>.meta.zst
   uint64 meta_len = 9;
   bytes meta_blake3 = 10;
@@ -38,4 +39,17 @@ message SnapshotManifest {
   uint64 data_bytes = 13;         // logical bytes referenced
   int64 created_ns = 14;
   bytes restorer_id = 15;         // which mount or job produced it
+
+  // Sealed volumes whose objects this snapshot's extents reference
+  // read-only (published volumes and clones, design §13). Mirrors the
+  // `bases` table of the metadata file, so a reader can list a volume's
+  // dependencies without downloading its metadata. Present only with
+  // meta_schema_version >= 2.
+  repeated BaseVolume bases = 16;
+}
+
+// A sealed volume another volume references.
+message BaseVolume {
+  bytes volume_id = 1;            // 16-byte id
+  string root = 2;                // its root in the same bucket: <prefix>/volumes/<id hex>
 }

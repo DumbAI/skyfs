@@ -45,13 +45,14 @@ pub(crate) fn all(conn: &Connection, ino: Ino) -> rusqlite::Result<Vec<Extent>> 
 }
 
 pub(crate) fn insert(conn: &Connection, ino: Ino, e: &Extent) -> rusqlite::Result<()> {
-    let (seg, obj) = match &e.loc {
-        Location::Segment { seq } => (Some(*seq), None),
-        Location::Object { key } => (None, Some(key.as_str())),
+    let (seg, obj, vol) = match &e.loc {
+        Location::Segment { seq } => (Some(*seq), None, None),
+        Location::Object { key } => (None, Some(key.as_str()), None),
+        Location::External { volume, key } => (None, Some(key.as_str()), Some(volume.as_slice())),
     };
     conn.prepare_cached(
-        "INSERT INTO extents (ino, off, len, seg, obj, chunk_off, chunk_len, crc, skip)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO extents (ino, off, len, seg, obj, chunk_off, chunk_len, crc, skip, vol)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?
     .execute(params![
         ino,
@@ -62,7 +63,8 @@ pub(crate) fn insert(conn: &Connection, ino: Ino, e: &Extent) -> rusqlite::Resul
         e.chunk_off,
         e.chunk_len,
         e.crc,
-        e.skip
+        e.skip,
+        vol
     ])?;
     Ok(())
 }

@@ -79,6 +79,27 @@ impl ObjectClient {
         &self.root
     }
 
+    /// A client for another volume in the same store (a base volume).
+    #[must_use]
+    pub fn sibling(&self, root: VolumeRoot) -> Self {
+        Self {
+            store: self.store.clone(),
+            root,
+        }
+    }
+
+    /// Copies `key` of `src` to the same key of this volume, server-side,
+    /// unless it already exists here. `src` must be in the same store
+    /// ([`ObjectClient::sibling`]). Only for immutable keys: an existing
+    /// copy holds the same bytes, so a retry never overwrites anything.
+    pub async fn copy_from(&self, src: &ObjectClient, key: &Key) -> Result<(), StoreError> {
+        debug_assert!(*key != Key::Hint, "the hint is mutable");
+        if self.exists(key).await? {
+            return Ok(());
+        }
+        Ok(self.store.copy(&src.path(key), &self.path(key)).await?)
+    }
+
     fn path(&self, key: &Key) -> ObjPath {
         ObjPath::from(self.root.join(key))
     }

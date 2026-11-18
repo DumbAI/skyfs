@@ -11,6 +11,7 @@
 //! blobs/<epoch:016x>/<n:016x>       large-write data, uploaded before the segment that references it
 //! wal/<seq:020>.seg                 log tail after the restore pointer, If-None-Match: *
 //! volume.json                       hint {snapshot gen, head seq}; mutable, never trusted
+//! sealed                            the volume is sealed: read-only forever (design §13)
 //! ```
 
 use std::fmt;
@@ -42,6 +43,20 @@ impl VolumeRoot {
     #[must_use]
     pub fn relative<'a>(&self, absolute: &'a str) -> Option<&'a str> {
         absolute.strip_prefix(self.0.as_str())?.strip_prefix('/')
+    }
+
+    /// The root of volume `volume_id` spelled `root` (as `Display` writes
+    /// it, e.g. from a `bases` row), or `None` if `root` is not the root of
+    /// that volume.
+    #[must_use]
+    pub fn parse(root: &str, volume_id: &[u8; 16]) -> Option<Self> {
+        let root = root.trim_matches('/');
+        let tail = format!("volumes/{}", hex(volume_id));
+        let ok = root == tail
+            || root
+                .strip_suffix(tail.as_str())
+                .is_some_and(|p| p.ends_with('/') && p.len() > 1);
+        ok.then(|| Self(root.to_owned()))
     }
 
     /// Absolute key of an object given its volume-relative key.
@@ -85,6 +100,10 @@ pub enum Key {
     },
     /// Content-addressed pack of repacked data (BLAKE3 of its bytes).
     Pack([u8; 32]),
+    /// The seal: present once the volume is sealed, never removed. A sealed
+    /// volume is mounted read-only only, and other volumes may reference
+    /// its objects (design §13).
+    Sealed,
 }
 
 impl fmt::Display for Key {
@@ -98,6 +117,7 @@ impl fmt::Display for Key {
             }
             Key::Blob { epoch, n } => write!(f, "blobs/{epoch:016x}/{n:016x}"),
             Key::Pack(hash) => write!(f, "packs/{}", hex(hash)),
+            Key::Sealed => f.write_str("sealed"),
         }
     }
 }
@@ -154,6 +174,9 @@ impl std::str::FromStr for Key {
 
         if s == "volume.json" {
             return Ok(Key::Hint);
+        }
+        if s == "sealed" {
+            return Ok(Key::Sealed);
         }
         if let Some(seq) = s.strip_prefix("wal/").and_then(|r| r.strip_suffix(".seg")) {
             return dec(seq, 20).map(Key::Segment).ok_or_else(err);
@@ -241,6 +264,7 @@ mod tests {
             },
             Key::Blob { epoch: 3, n: 255 },
             Key::Pack([0xab; 32]),
+            Key::Sealed,
         ] {
             assert_eq!(key.to_string().parse::<Key>().unwrap(), key);
         }
@@ -278,6 +302,26 @@ mod tests {
         let abs = root.join(&Key::Segment(3));
         assert_eq!(root.relative(&abs), Some("wal/00000000000000000003.seg"));
         assert!(abs.starts_with(&root.class_prefix(KeyClass::Segments)));
+    }
+
+    #[test]
+    fn volume_roots_parse_back_only_for_their_volume() {
+        let id = [0x01; 16];
+        for prefix in ["", "users/u1", "published/v3"] {
+            let root = VolumeRoot::new(prefix, &id);
+            let s = root.to_string();
+            assert_eq!(VolumeRoot::parse(&s, &id), Some(root.clone()));
+            assert_eq!(VolumeRoot::parse(&format!("/{s}/"), &id), Some(root));
+            assert_eq!(VolumeRoot::parse(&s, &[0x02; 16]), None);
+        }
+        for bad in [
+            "",
+            "volumes",
+            "x/volumes",
+            "uservolumes/01010101010101010101010101010101",
+        ] {
+            assert_eq!(VolumeRoot::parse(bad, &id), None, "{bad}");
+        }
     }
 
     #[test]

@@ -45,6 +45,44 @@ pub enum Command {
         #[arg(long, env = "SKYFS_VOLUME")]
         volume: String,
     },
+    /// Publish a quiescent volume as a new sealed, read-only volume
+    /// (design §13): its own objects are copied server-side, then sealed.
+    /// Prints the new volume's id.
+    Publish {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// The volume to publish (cleanly unmounted).
+        #[arg(long, env = "SKYFS_VOLUME")]
+        volume: String,
+        /// Id of the published volume (32 hex digits); random if omitted.
+        #[arg(long)]
+        to: Option<String>,
+        /// Tenant prefix of the published volume within the bucket (default:
+        /// the store URL's prefix).
+        #[arg(long)]
+        to_prefix: Option<String>,
+        /// Leave out this path (relative to the volume root) and everything
+        /// below it. Repeatable.
+        #[arg(long)]
+        exclude: Vec<String>,
+    },
+    /// Create a writable volume as a clone of a sealed volume: metadata
+    /// only, the data stays in the sealed volume (design §13). Prints the
+    /// new volume's id.
+    Clone {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// The sealed volume to clone.
+        #[arg(long)]
+        base: String,
+        /// Tenant prefix of the sealed volume within the bucket (default:
+        /// the store URL's prefix).
+        #[arg(long)]
+        base_prefix: Option<String>,
+        /// Id of the new volume (32 hex digits); random if omitted.
+        #[arg(long, env = "SKYFS_VOLUME")]
+        volume: Option<String>,
+    },
     /// Show the restore pointer and log head of a volume.
     Info {
         #[command(flatten)]
@@ -220,6 +258,20 @@ pub struct StoreArgs {
 }
 
 impl StoreArgs {
+    /// Publish and clone read one volume and write another; a session
+    /// policy narrows a credential to one volume, so they need the role's
+    /// own scope.
+    pub fn check_two_volumes(&self) -> Result<(), String> {
+        if matches!(self.credentials, CredentialKind::Oidc) && !self.no_session_policy {
+            return Err(
+                "publish and clone use two volumes: with --credentials oidc, pass \
+                        --no-session-policy and scope the role to both"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn config(&self) -> Result<StoreConfig, String> {
         let credentials = match self.credentials {
             CredentialKind::Ambient => CredentialSource::Ambient,

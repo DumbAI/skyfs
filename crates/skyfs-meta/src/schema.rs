@@ -4,7 +4,24 @@
 //! version it was written with and a mount refuses one it does not know.
 
 /// Version of the tables below, stored in `meta` and in snapshot manifests.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// - 1: the original tables.
+/// - 2: `extents.vol` and `bases` (extents in sealed base volumes, design
+///   §13). Version 1 files are migrated on open ([`MIGRATE_1_TO_2`]).
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Versions this build reads (and migrates to [`SCHEMA_VERSION`] on open).
+pub const READABLE: [u32; 2] = [1, SCHEMA_VERSION];
+
+/// Version 1 to 2: both additions are empty, so every v1 extent keeps its
+/// meaning (an object of this volume).
+pub const MIGRATE_1_TO_2: &str = r"
+ALTER TABLE extents ADD COLUMN vol BLOB;
+CREATE TABLE bases (
+    vol  BLOB PRIMARY KEY,
+    root TEXT NOT NULL
+) WITHOUT ROWID;
+";
 
 pub const CREATE: &str = r"
 CREATE TABLE meta (
@@ -42,7 +59,8 @@ CREATE UNIQUE INDEX dirents_by_cookie ON dirents (parent, cookie);
 CREATE INDEX dirents_by_ino ON dirents (ino);
 
 -- Exactly one of seg (inline bytes of a log segment) and obj (an object key)
--- is set.
+-- is set. vol, with obj, names the sealed base volume that owns the object
+-- (a row of `bases`); NULL means this volume.
 CREATE TABLE extents (
     ino       INTEGER NOT NULL,
     off       INTEGER NOT NULL,
@@ -53,6 +71,7 @@ CREATE TABLE extents (
     chunk_len INTEGER NOT NULL,
     crc       INTEGER NOT NULL,
     skip      INTEGER NOT NULL,
+    vol       BLOB,
     PRIMARY KEY (ino, off)
 ) WITHOUT ROWID;
 CREATE INDEX extents_by_seg ON extents (seg) WHERE seg IS NOT NULL;
@@ -63,6 +82,13 @@ CREATE TABLE xattrs (
     name  BLOB NOT NULL,
     value BLOB NOT NULL,
     PRIMARY KEY (ino, name)
+) WITHOUT ROWID;
+
+-- Sealed volumes whose objects extents reference read-only (design §13),
+-- with their root in the bucket. Never collected by this volume's GC.
+CREATE TABLE bases (
+    vol  BLOB PRIMARY KEY,
+    root TEXT NOT NULL
 ) WITHOUT ROWID;
 
 -- Packs written by restore passes and their sizes, to find sparse ones.

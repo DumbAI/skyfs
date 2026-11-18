@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use skyfs_format::snapshot::v1::SnapshotManifest;
-use skyfs_meta::{MetaStore, SCHEMA_VERSION};
+use skyfs_format::snapshot::v1::{BaseVolume, SnapshotManifest};
+use skyfs_meta::{MetaStore, READABLE_SCHEMA_VERSIONS, SCHEMA_VERSION};
 use skyfs_store::{Created, Key, ObjectClient, find_end};
 
 use crate::error::VolumeError;
@@ -58,9 +58,9 @@ pub async fn read_manifest(
             m.r#gen
         )));
     }
-    if m.meta_schema_version != SCHEMA_VERSION {
+    if !READABLE_SCHEMA_VERSIONS.contains(&m.meta_schema_version) {
         return Err(VolumeError::Corrupt(format!(
-            "snapshot {generation} has metadata schema {}, this build reads {SCHEMA_VERSION}",
+            "snapshot {generation} has metadata schema {}, this build reads {READABLE_SCHEMA_VERSIONS:?}",
             m.meta_schema_version
         )));
     }
@@ -127,6 +127,7 @@ pub struct Exported {
     compressed: Vec<u8>,
     pos: skyfs_meta::Position,
     stats: skyfs_meta::StoreStats,
+    bases: Vec<skyfs_meta::BaseVolume>,
 }
 
 /// Serializes `replica` (exactly at the end of a segment) for a snapshot:
@@ -137,6 +138,7 @@ pub fn export(replica: &MetaStore, scratch: &Path, tag: u64) -> Result<Exported,
         return Err(VolumeError::Corrupt("snapshot of an empty replica".into()));
     }
     let stats = replica.stats()?;
+    let bases = replica.bases()?;
     let file = scratch.join(format!("snapshot-{tag}.db"));
     let _ = std::fs::remove_file(&file);
     replica.export_snapshot(&file)?;
@@ -147,6 +149,7 @@ pub fn export(replica: &MetaStore, scratch: &Path, tag: u64) -> Result<Exported,
         compressed,
         pos,
         stats,
+        bases,
     })
 }
 
@@ -185,6 +188,7 @@ pub async fn upload_meta(
         compressed,
         pos,
         stats,
+        bases,
     } = exported;
     let restored_seq = pos.applied_seq.unwrap_or(0);
     let hash = *blake3::hash(&compressed).as_bytes();
@@ -211,6 +215,13 @@ pub async fn upload_meta(
         data_bytes: stats.data_bytes,
         created_ns: now_ns(),
         restorer_id: id.restorer_id.as_bytes().to_vec(),
+        bases: bases
+            .into_iter()
+            .map(|b| BaseVolume {
+                volume_id: b.volume.to_vec(),
+                root: b.root,
+            })
+            .collect(),
     })
 }
 

@@ -1,5 +1,5 @@
-//! The `skyfs` command: create, mount (FUSE on Linux, NFS on macOS), fsck,
-//! info.
+//! The `skyfs` command: create, mount (FUSE on Linux, NFS on macOS),
+//! publish, clone, fsck, info.
 
 mod cli;
 #[cfg(target_os = "linux")]
@@ -10,7 +10,7 @@ mod signal;
 use std::process::ExitCode;
 
 use clap::Parser;
-use skyfs_store::{ObjectClient, VolumeRoot, backend, hex};
+use skyfs_store::{Key, ObjectClient, VolumeRoot, backend, hex};
 use skyfs_volume::{AtimeMode, CreateOptions, FsyncMode, Replication, VolumeConfig};
 
 use cli::{
@@ -32,6 +32,21 @@ fn client(
         b.store,
         VolumeRoot::new(&b.prefix, &volume_id),
     ))
+}
+
+/// The tenant prefix `c`'s root was made with.
+fn prefix_of(c: &ObjectClient, id: &[u8; 16]) -> String {
+    let root = c.root().to_string();
+    root.strip_suffix(&format!("volumes/{}", hex(id)))
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+/// `path` is `dir` or lies below it (whole path components).
+fn is_at_or_below(path: &[u8], dir: &[u8]) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.is_empty() || rest.first() == Some(&b'/'))
 }
 
 fn rt() -> Result<tokio::runtime::Runtime> {
@@ -83,6 +98,19 @@ fn run(cli: Cli) -> Result<()> {
                 Err(format!("{} problems", problems.len()))
             }
         }
+        Command::Publish {
+            store,
+            volume,
+            to,
+            to_prefix,
+            exclude,
+        } => publish(&store, &volume, to.as_deref(), to_prefix, &exclude),
+        Command::Clone {
+            store,
+            base,
+            base_prefix,
+            volume,
+        } => clone(&store, &base, base_prefix, volume.as_deref()),
         Command::Info { store, volume } => {
             let id = parse_volume_id(&volume)?;
             let c = client(&store, id, "skyfs-info", true)?;
@@ -100,11 +128,85 @@ fn run(cli: Cli) -> Result<()> {
                 println!("inodes           {}", m.inode_count);
                 println!("data bytes       {}", m.data_bytes);
                 println!("hint head seq    {}", hint.head_seq);
+                let sealed = c.exists(&Key::Sealed).await.map_err(|e| e.to_string())?;
+                println!("sealed           {sealed}");
+                for b in &m.bases {
+                    println!("base             {} ({})", hex(&b.volume_id), b.root);
+                }
                 Ok(())
             })
         }
         Command::Mount(args) => mount(&args),
     }
+}
+
+/// `skyfs publish`: seal a copy of a quiescent volume, leaving out
+/// `exclude` (paths relative to the volume root, with everything below).
+fn publish(
+    store: &StoreArgs,
+    volume: &str,
+    to: Option<&str>,
+    to_prefix: Option<String>,
+    exclude: &[String],
+) -> Result<()> {
+    store.check_two_volumes()?;
+    let src_id = parse_volume_id(volume)?;
+    let dst_id = match to {
+        Some(v) => parse_volume_id(v)?,
+        None => rand::random(),
+    };
+    let src = client(store, src_id, "skyfs-publish", true)?;
+    let prefix = to_prefix.unwrap_or_else(|| prefix_of(&src, &src_id));
+    let dst = src.sibling(VolumeRoot::new(&prefix, &dst_id));
+    let excluded: Vec<Vec<u8>> = exclude
+        .iter()
+        .map(|p| p.trim_matches('/').as_bytes().to_vec())
+        .collect();
+    let mut keep = |path: &[u8], _| !excluded.iter().any(|e| is_at_or_below(path, e));
+    let scratch = std::env::temp_dir().join(format!("skyfs-publish-{}", hex(&dst_id)));
+    let p = skyfs_volume::publish_volume(&src, src_id, &dst, dst_id, &mut keep, &scratch)
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(scratch);
+    eprintln!(
+        "published {} inodes, {} bytes; copied {} objects; left out {} entries; {} base volumes",
+        p.inodes,
+        p.data_bytes,
+        p.copied_objects,
+        p.pruned.entries,
+        p.bases.len()
+    );
+    println!("{}", hex(&dst_id));
+    Ok(())
+}
+
+/// `skyfs clone`: a new volume over a sealed one, metadata only.
+fn clone(
+    store: &StoreArgs,
+    base: &str,
+    base_prefix: Option<String>,
+    volume: Option<&str>,
+) -> Result<()> {
+    store.check_two_volumes()?;
+    let base_id = parse_volume_id(base)?;
+    let dst_id = match volume {
+        Some(v) => parse_volume_id(v)?,
+        None => rand::random(),
+    };
+    let dst = client(store, dst_id, "skyfs-clone", false)?;
+    let prefix = base_prefix.unwrap_or_else(|| prefix_of(&dst, &dst_id));
+    let base_client = dst.sibling(VolumeRoot::new(&prefix, &base_id));
+    let scratch = std::env::temp_dir().join(format!("skyfs-clone-{}", hex(&dst_id)));
+    let c = skyfs_volume::clone_volume(&base_client, base_id, &dst, dst_id, &scratch)
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(scratch);
+    eprintln!(
+        "cloned {} inodes, {} bytes, nothing copied; {} base volumes",
+        c.inodes,
+        c.data_bytes,
+        c.bases.len()
+    );
+    println!("{}", hex(&dst_id));
+    Ok(())
 }
 
 fn volume_config(args: &MountArgs) -> VolumeConfig {

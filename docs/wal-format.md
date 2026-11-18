@@ -96,10 +96,27 @@ A reader accepts segment `seq` only if all hold; otherwise the mount fails:
 | `packs/<blake3 hex>` | inline data repacked by restore | immutable, content-addressed |
 | `blobs/<epoch:016x>/<n:016x>` | large write data | immutable |
 | `volume.json` | hint `{snapshot_gen, head_seq}` | mutable; never trusted for correctness |
+| `sealed` | JSON naming the source of a published volume (informational) | immutable, `If-None-Match: *`; its *presence* seals the volume (design §13) |
 
 The log holds only the tail after the latest snapshot's `restored_seq`
 (plus whatever retention keeps). Segments are deleted from the old end,
 never rewritten.
+
+## Snapshot metadata schema
+
+The metadata file is SQLite (`skyfs-meta::schema`); its version is in the
+file and in `SnapshotManifest.meta_schema_version`. Readers accept every
+version in `READABLE` and migrate older files on open.
+
+| Version | Change |
+|---|---|
+| 1 | inodes, dirents, extents (`seg` or `obj`), xattrs, packs, garbage |
+| 2 | `extents.vol`: with `obj`, the 16-byte id of the sealed base volume that owns the object (`NULL`: this volume); table `bases (vol, root)`. Manifests list the same bases in `bases` (field 16). A version-1 file migrates by adding both, empty |
+
+A snapshot written by `publish` or `clone` (design §13) is generation 0
+with no log: its restore pointer is `restored_seq = 0` and a
+`restored_digest` that names how and from what it was made. Segment 1's
+`prev_digest` must equal it, as for any snapshot.
 
 ## Evolution
 
@@ -108,6 +125,9 @@ never rewritten.
 - A new optional field is allowed only when a reader that ignores it
   computes the same state. Otherwise it is a new op.
 - An incompatible layout change bumps the magic's version byte.
+- A metadata schema change bumps `SCHEMA_VERSION`, keeps the previous
+  versions readable (migrate on open), and is written into new manifests,
+  so older binaries refuse what they cannot read.
 - A golden segment (`crates/skyfs-format/tests/golden.rs`) holds one
   record of every op with fixed values and pins its bytes by BLAKE3;
   changing any encoding fails it, and is a format change.

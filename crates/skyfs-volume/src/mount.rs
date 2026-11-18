@@ -20,7 +20,7 @@ use skyfs_format::snapshot::v1::SnapshotManifest;
 use skyfs_format::wal::v1::{MountBegin, Record, SegmentHeader, VolumeCreate, record::Op};
 use skyfs_format::{Preamble, Segment, SegmentBuilder};
 use skyfs_meta::MetaStore;
-use skyfs_store::{Cache, Created, Key, ObjectClient, find_end};
+use skyfs_store::{Cache, Created, Key, ObjectClient, VolumeRoot, find_end, hex};
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::config::{CreateOptions, VolumeConfig};
@@ -37,6 +37,31 @@ const META_PREFETCH: u64 = 1 << 20;
 
 /// Seqs probed past the apparent head to detect a hole in the log.
 const GAP_PROBE: u64 = 16;
+
+/// Clients for the sealed base volumes `store` lists (design §13), each
+/// checked to be sealed: a base that could still change or be collected
+/// would make this volume's extents dangle, so fail closed.
+pub(crate) async fn base_clients(
+    client: &ObjectClient,
+    store: &MetaStore,
+) -> Result<Vec<([u8; 16], ObjectClient)>, VolumeError> {
+    let mut out = Vec::new();
+    for b in store.bases()? {
+        let root = VolumeRoot::parse(&b.root, &b.volume).ok_or_else(|| {
+            VolumeError::Corrupt(format!(
+                "base volume {} has a malformed root {:?}",
+                hex(&b.volume),
+                b.root
+            ))
+        })?;
+        let base = client.sibling(root);
+        if !base.exists(&Key::Sealed).await? {
+            return Err(VolumeError::NotSealed(base.root().to_string()));
+        }
+        out.push((b.volume, base));
+    }
+    Ok(out)
+}
 
 /// Creates a volume: segment 0 holding `VolumeCreate`, and snapshot 0.
 pub async fn create(
@@ -418,6 +443,9 @@ pub(crate) async fn mount(
     cfg: VolumeConfig,
     rt: tokio::runtime::Handle,
 ) -> Result<Mounted, VolumeError> {
+    if !cfg.read_only && client.exists(&Key::Sealed).await? {
+        return Err(VolumeError::Sealed(client.root().to_string()));
+    }
     let local_lock = lock_local_dir(&cfg.local_dir, cfg.local_lock_wait).await?;
     let d = dirs(&cfg.local_dir)?;
     let not_found = || VolumeError::NotFound(client.root().to_string());
@@ -432,6 +460,9 @@ pub(crate) async fn mount(
     } = replay(&client, volume_id, &d.meta, !cfg.read_only).await?;
     let cache = Arc::new(Cache::open(&d.cache, cfg.cache_limit)?);
     let data = DataReader::new(client.clone(), cache.clone(), d.wal.clone());
+    for (volume, base) in base_clients(&client, &live).await? {
+        data.add_base(volume, base);
+    }
     for (seq, off) in offsets {
         data.set_data_offset(seq, off);
     }
@@ -611,5 +642,9 @@ pub async fn fsck(
 ) -> Result<(Vec<String>, u64), VolumeError> {
     let r = replay(client, volume_id, scratch, false).await?;
     let head = r.chain.next_seq.saturating_sub(1);
-    Ok((r.live.fsck()?, head))
+    let mut problems = r.live.fsck()?;
+    if let Err(e) = base_clients(client, &r.live).await {
+        problems.push(e.to_string());
+    }
+    Ok((problems, head))
 }

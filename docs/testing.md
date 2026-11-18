@@ -107,6 +107,23 @@ unit:
 | `a_read_only_mount_serves_and_writes_nothing` | no epoch, no log, no restore, `EROFS` |
 | `dot_finds_any_inode_for_file_handles` | `lookup(ino, ".")` for NFS export and `open_by_handle_at` |
 
+`tests/published.rs` covers published volumes and clones (design §13):
+
+| Test | Proves |
+|---|---|
+| `publish_seals_a_pruned_copy_of_the_source` | only the kept files' objects are copied; the copy is sealed (read-write mount refused) and never references its source; a retry is recognised; a source that moved on cannot be republished to the same id |
+| `a_clone_copies_metadata_only_and_writes_copy_on_write` | no data object is created by a clone; files, hard links, symlinks and xattrs read through; overwrite, append, add and delete stay in the clone; the base's objects are byte-for-byte unchanged |
+| `a_clone_never_collects_its_base` | eager GC over several mounts after deleting everything inherited leaves the base intact, and the clone's own live data (with keys equal to the base's) survives |
+| `clones_of_published_clones_reference_the_owning_volumes` | publishing a clone copies only its own objects; a clone of that has both bases and reads one hop |
+| `publish_needs_a_quiescent_source_and_clone_a_sealed_base` | publish refuses a mounted or crashed source and commits nothing; clone refuses an unsealed base |
+| `a_clone_refuses_to_mount_over_an_unsealed_base_and_never_overwrites` | a lost seal fails mount and fsck closed; a clone over another base's clone is `Exists` |
+| `publish_survives_a_fault_at_every_mutation`, `clone_survives_a_fault_at_every_mutation` | every fault at every mutation (copies, metadata, seal, manifest, hint): what is visible is complete, and a retry converges |
+
+`skyfs-meta/tests/genesis.rs` covers the metadata side: pruning with hard
+links, externalizing without chains, genesis identity, refusing a store
+that is not a snapshot, fsck of an unlisted base, and migrating a
+schema-1 file.
+
 `wal.rs` unit tests check that a sealed local segment decodes like the
 builder made it, and that recovery cuts a torn tail and rebuilds the same
 record region.
