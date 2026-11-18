@@ -5,6 +5,7 @@ description = "skyfs daemon and CLI: create, mount (FUSE on Linux, NFS on macOS)
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [[bin]]

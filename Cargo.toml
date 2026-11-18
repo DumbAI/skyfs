@@ -8,6 +8,7 @@ exclude = ["vendor/*"]
 edition = "2024"
 rust-version = "1.96"
 repository = "https://github.com/DumbAI/skyfs"
+license = "Apache-2.0"
 publish = false
 
 [workspace.lints.rust]

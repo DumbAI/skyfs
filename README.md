@@ -212,3 +212,9 @@ bucket, `scripts/s3-e2e.sh`. What each suite proves:
 [docs/testing.md](docs/testing.md).
 
 No `protoc` is needed: `build.rs` compiles the proto with `protox`.
+
+## License
+
+Apache License 2.0 ([LICENSE](LICENSE)), except the vendored NFSv3 server
+in `vendor/nessie-nfsserve`, which keeps its own license
+(`BSD-3-Clause AND (MIT OR Apache-2.0)`; see its `LICENSE-UPSTREAM-BSD3`).

@@ -5,6 +5,7 @@ description = "skyfs engine: local WAL, replication, mount and recovery, restore
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

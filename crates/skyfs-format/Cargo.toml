@@ -5,6 +5,7 @@ description = "skyfs on-bucket formats: log segments and snapshot manifests (no 
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]
