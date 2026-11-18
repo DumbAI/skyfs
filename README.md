@@ -130,6 +130,34 @@ In a container: `--device /dev/fuse --cap-add SYS_ADMIN`, or run skyfs on
 the host or in a privileged sidecar and bind-propagate the mount so the app
 container holds no credentials at all.
 
+### In Kubernetes
+
+`Dockerfile` builds the daemon image (`docker build -t skyfs .`): the
+binary, `fuse3`, CA certificates and a shell. As a sidecar that propagates
+its mount to the app container:
+
+- Run it as a **native sidecar** (an init container with
+  `restartPolicy: Always`, privileged, `mountPropagation: Bidirectional` on
+  a hostPath; the app mounts the same hostPath with `HostToContainer`). The
+  kubelet then stops the app before skyfs: an unmount fails with `EBUSY`
+  while the app holds files open, and that skips the drain.
+- Keep `--cache-dir` on a hostPath, not an `emptyDir`, so the next daemon on
+  the node recovers operations not yet uploaded.
+- Give the pod a grace period longer than `--restore-on-exit-timeout`
+  (default 60 s).
+- Share a plain directory and mount the volume one level *below* it. A dead
+  mount (the daemon was killed) left on the hostPath itself makes every
+  later container that mounts it fail at creation (`transport endpoint is
+  not connected` when the runtime stats it); below it, the next sidecar
+  can `umount -l` it, and the unmount propagates to the node. skyfs does
+  not remove a dead predecessor's mount itself.
+- Run skyfs as a child of a shell that forwards SIGTERM: as PID 1 it
+  ignores signals until it serves.
+- Create the volume before the first mount (`skyfs create`, or
+  `skyfs_volume::mount::create` from a provisioning tool, which can then
+  check the bucket and its keys before any machine exists); the sidecar
+  only mounts.
+
 ## Documents
 
 | | |
