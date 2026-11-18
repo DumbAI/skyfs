@@ -144,6 +144,15 @@ pub enum Location {
         /// Volume-relative key, as written in the log or by the restorer.
         key: String,
     },
+    /// An immutable object of a sealed base volume, read-only (design §13).
+    /// Only snapshots written by clone or publish create these; the log
+    /// never names one, and this volume's GC never collects one.
+    External {
+        /// The base volume's 16-byte id (a row of the `bases` table).
+        volume: [u8; 16],
+        /// Key relative to the base volume's root.
+        key: String,
+    },
 }
 
 /// A mapping of file bytes `[off, off + len)` onto stored bytes.

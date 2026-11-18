@@ -11,6 +11,10 @@
 //!   metadata changes, it is used by the live writer, by mount replay and by
 //!   the restore replica, and it never fails on a valid log: a failure is
 //!   corruption.
+//! - [`MetaStore::retain_paths`], [`MetaStore::externalize`] and
+//!   [`MetaStore::reset_genesis`] are the one exception, and never touch a
+//!   mounted volume's state: they turn a *copy* of a snapshot into the first
+//!   snapshot of another volume (publish and clone, design §13).
 //!
 //! The store is SQLite (design §5.1). A snapshot is the store serialized with
 //! `VACUUM INTO`, so the same file format is the live store, the restore
@@ -19,16 +23,18 @@
 mod apply;
 mod errno;
 mod extents;
+mod genesis;
 mod model;
 pub mod plan;
 mod schema;
 mod store;
 
 pub use errno::Errno;
+pub use genesis::{BaseVolume, Pruned};
 pub use model::{
     Attr, DirEntry, Extent, Ino, Kind, Location, Position, ROOT_INO, StoreStats, VolumeInfo,
 };
-pub use schema::SCHEMA_VERSION;
+pub use schema::{READABLE as READABLE_SCHEMA_VERSIONS, SCHEMA_VERSION};
 pub use store::{ApplyError, MetaError, MetaStore, Relocation};
 
 /// Permission, set-id and sticky bits: everything in `mode` but the file type.

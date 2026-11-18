@@ -398,7 +398,11 @@ impl Harness {
                 let base = Preamble::decode(&seg).unwrap().data_offset() as usize;
                 seg[base + off..base + off + len].to_vec()
             }
-            Location::Object { key } => self.blobs[key][off..off + len].to_vec(),
+            // In these tests a base volume's objects are the harness's own
+            // blobs under the same keys (externalize keeps the key).
+            Location::Object { key } | Location::External { key, .. } => {
+                self.blobs[key][off..off + len].to_vec()
+            }
         }
     }
 

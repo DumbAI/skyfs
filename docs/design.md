@@ -923,6 +923,8 @@ add` and `commit` of them 3 s. `uv pip install numpy pandas requests rich`
 | NFS transport: the daemon dies | Calls on the mount fail with `EINTR` when interrupted; after `deadtimeout` (60 s) macOS removes the mount. A restart on the same cache recovers the local WAL, and the client resends uncommitted writes (the verifier changed) |
 | Two daemons on one cache directory | The second waits for the first's lock (`local_lock_wait`), then fails |
 | A segment deleted from the middle of the log | Mount refused: the head probe would stop at the hole, so it checks the hint and the next 16 seqs (§7.3) |
+| A clone's base is missing, or not sealed | Mount and fsck refuse it: the base could change or be collected under the clone (§13) |
+| A crash or lost response during publish or clone | No volume or a complete one; a retry recognises its own committed genesis by its digest (§13) |
 
 ## 12. Build order and what settles the open questions
 
@@ -1018,3 +1020,83 @@ Benchmark before step 4 ships:
 - Cold read throughput of an 8 GB model through skyfs vs direct GETs.
 - `fsync` latency in sync mode from Lambda, Hyperstack and DigitalOcean.
 - SQLite on skyfs (InvokeAI) under both modes.
+
+## 13. Published volumes and clones
+
+A *published* volume is a sealed, read-only copy of another volume's
+state. A *clone* is a writable volume whose first snapshot is a published
+volume's metadata, with every extent still pointing into the published
+volume: making it copies no data. This is what an application catalog
+needs to hand a large, prepared workspace to many users: publish once,
+clone in seconds, pay storage only for what each clone changes.
+
+### 13.1 External extents
+
+An extent's location gains a third kind, `External { volume, key }`: an
+immutable object of another, **sealed** volume, read-only (schema 2:
+`extents.vol` and the `bases` table, wal-format.md). Writes never create
+one, and the log never names one; only `publish` and `clone` write them,
+into a snapshot.
+
+- **Reads** go through a client for the base's root (same bucket), with
+  the same chunk CRCs as any extent. The chunk cache key carries the base's
+  id, so equal keys in two volumes never collide.
+- **Writes** are copy-on-write by construction: an overwrite splits the
+  extent and the new bytes are this volume's; `CloneRange` shares an
+  external extent like any other.
+- **GC, repacking and pack accounting** see only `vol IS NULL`. A base's
+  objects are never this volume's garbage, and GC deletes keys relative to
+  this volume's own root, so it cannot reach a base even by mistake. Equal
+  relative keys (both volumes write `blobs/<epoch 1>/0`) do not confuse
+  which own objects are live.
+- **References never chain.** A clone's own extents become references to
+  the volume it clones; extents that already pointed into older bases
+  are kept. A read is one hop, however many generations of clones.
+
+### 13.2 Sealing
+
+`sealed` is written with `If-None-Match: *` and never removed. A sealed
+volume is never mounted read-write (the mount refuses), so it has no
+writer, no restorer and no GC: its objects never change or disappear.
+Mount and fsck of a clone check that every base is sealed, and refuse
+otherwise. When a sealed volume may be deleted is the caller's decision
+(it must know nothing references it); skyfs keeps no cross-volume
+reference counts.
+
+### 13.3 Genesis snapshots
+
+Both operations write generation 0 of a new volume, with no log. Its
+restore pointer is `restored_seq = 0` with
+`restored_digest = BLAKE3("skyfs/genesis/v1" ‖ how ‖ new id ‖ source id ‖
+source meta BLAKE3)`, in epoch 0 of a cleanly ended history. The first
+`MountBegin` (seq 1, epoch 1) chains from that digest, so mount, replay,
+fencing and the restorer work unchanged. Inode numbers and op ids
+continue from the source.
+
+| Step | publish(src → dst, keep) | clone(base → dst) |
+|---|---|---|
+| Precondition | src quiescent: its latest snapshot has no log after it and its last mount ended cleanly (a clean unmount does this) | base sealed |
+| Metadata | src's latest snapshot, minus the paths `keep` rejects (inodes nothing kept reaches go; link counts recomputed) | base's snapshot, own extents made external to base |
+| Data | src's own objects the kept files use, copied server-side; references to older bases kept | none |
+| Commit | metadata → `sealed` → manifest 0 | metadata → manifest 0 |
+
+The seal is written before the manifest, so no reader ever sees a
+published volume unsealed. A retry first checks generation 0: if its
+`restored_digest` is the one this exact operation would write, the
+earlier attempt committed and is returned; any other volume there is
+refused (`Exists`). Copies are skipped when the object exists (same key,
+same immutable source), so no retry overwrites anything.
+
+Publishing copies instead of referencing the source because the source
+stays writable: a read credential for its prefix would expose whatever
+it writes later, and it may be deleted. A published volume depends only
+on itself and on sealed bases.
+
+### 13.4 Credentials
+
+Publish and clone read one volume and write another. A session policy
+narrows an OIDC credential to one volume, so the CLI requires
+`--no-session-policy` with OIDC, and a role scoped to both. A clone's
+daemon reads its bases with its own credential: static keys scoped to
+the bucket work as is; per-volume OIDC policies would need the bases'
+roots added read-only (open).

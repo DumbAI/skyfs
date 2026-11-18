@@ -48,8 +48,13 @@ skyfs create --store s3://bucket/tenant --region us-east-2
 skyfs mount --store s3://bucket/tenant --volume <id> --cache-dir /var/cache/skyfs \
   --replication async --max-lag 1s /mnt/data
 
-skyfs info --store ... --volume <id>   # restore pointer and log head
+skyfs info --store ... --volume <id>   # restore pointer, log head, seal and bases
 skyfs fsck --store ... --volume <id>   # replay from the bucket and check invariants
+
+# Publish a cleanly unmounted volume as a sealed, read-only copy (prints its id),
+# then clone it: metadata only, the data stays in the sealed volume (design §13).
+skyfs publish --store s3://bucket/tenant --volume <id> --to-prefix published --exclude output
+skyfs clone --store s3://bucket/tenant2 --base <published id> --base-prefix published
 
 # Or through mount(8) / fstab, with scripts/mount.fuse.skyfs as /sbin/mount.fuse.skyfs:
 mount -t fuse.skyfs <id> /mnt/data -o store=s3://bucket/tenant,credentials=oidc,...

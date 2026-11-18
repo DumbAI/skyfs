@@ -6,6 +6,9 @@
 //! and blobs this mount wrote), cached chunks, and finally a range GET.
 //! Bytes from any source are verified before they are served, and a source
 //! that fails verification is skipped, never trusted.
+//!
+//! An extent in a sealed base volume (design §13) is read the same way
+//! through that volume's client; it is never in the local WAL or adopted.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -16,7 +19,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use skyfs_format::{PREAMBLE_LEN, Preamble};
 use skyfs_meta::{Errno, Extent, Location};
-use skyfs_store::{Cache, Key, ObjectClient};
+use skyfs_store::{Cache, Key, ObjectClient, hex};
 
 use crate::wal;
 
@@ -39,6 +42,9 @@ pub enum ReadError {
     /// A location that is not a key of this layout.
     #[error("bad object key {0:?}")]
     BadKey(String),
+    /// An extent in a base volume this mount has no client for.
+    #[error("extent in base volume {0}, which this mount does not know")]
+    UnknownBase(String),
 }
 
 impl From<ReadError> for Errno {
@@ -61,6 +67,8 @@ pub struct DataReader {
     wal_dir: PathBuf,
     /// Data-region offsets of committed segments, for range GETs.
     offsets: Mutex<HashMap<u64, u64>>,
+    /// Clients of the sealed base volumes extents may point into.
+    bases: Mutex<HashMap<[u8; 16], ObjectClient>>,
 }
 
 fn read_file(path: &Path, off: u64, len: u64) -> Option<Vec<u8>> {
@@ -80,7 +88,13 @@ impl DataReader {
             cache,
             wal_dir,
             offsets: Mutex::new(HashMap::new()),
+            bases: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Registers the client of sealed base volume `volume`.
+    pub fn add_base(&self, volume: [u8; 16], client: ObjectClient) {
+        self.bases.lock().insert(volume, client);
     }
 
     /// Records where segment `seq`'s data region starts in its object.
@@ -112,37 +126,59 @@ impl DataReader {
         crc: u32,
     ) -> Result<Vec<u8>, ReadError> {
         let ok = |b: &Vec<u8>| crc32c::crc32c(b) == crc;
-        let (local, adopted_id, remote_key) = match loc {
+        let parse = |key: &String| {
+            key.parse::<Key>()
+                .map_err(|_| ReadError::BadKey(key.clone()))
+        };
+        // Local copies exist only for this volume's own segments and blobs.
+        let (local, adopted_id, remote_key, client) = match loc {
             Location::Segment { seq } => (
                 Some(wal::dat_path(&self.wal_dir, *seq)),
-                segment_data_id(*seq),
+                Some(segment_data_id(*seq)),
                 Key::Segment(*seq),
+                self.client.clone(),
             ),
             Location::Object { key } => {
-                let k: Key = key.parse().map_err(|_| ReadError::BadKey(key.clone()))?;
+                let k = parse(key)?;
                 let local = match k {
                     Key::Blob { epoch, n } => Some(wal::blob_path(&self.wal_dir, epoch, n)),
                     _ => None,
                 };
-                (local, key.clone(), k)
+                (local, Some(key.clone()), k, self.client.clone())
+            }
+            Location::External { volume, key } => {
+                let client = self
+                    .bases
+                    .lock()
+                    .get(volume)
+                    .cloned()
+                    .ok_or_else(|| ReadError::UnknownBase(hex(volume)))?;
+                (None, None, parse(key)?, client)
             }
         };
         if let Some(b) = local.and_then(|p| read_file(&p, off, len)).filter(ok) {
             return Ok(b);
         }
-        if let Some(b) = self.cache.read_object(&adopted_id, off, len).filter(ok) {
+        if let Some(b) = adopted_id
+            .and_then(|id| self.cache.read_object(&id, off, len))
+            .filter(ok)
+        {
             return Ok(b);
         }
         let abs = match loc {
             Location::Segment { seq } => self.data_offset(*seq).await? + off,
-            Location::Object { .. } => off,
+            Location::Object { .. } | Location::External { .. } => off,
         };
-        let cache_key = remote_key.to_string();
+        // Own objects keep their volume-relative key (existing caches stay
+        // valid); a base's carry its id, so equal keys never collide.
+        let cache_key = match loc {
+            Location::External { volume, .. } => format!("{}/{remote_key}", hex(volume)),
+            _ => remote_key.to_string(),
+        };
         if let Some(b) = self.cache.get_chunk(&cache_key, abs, len).filter(ok) {
             return Ok(b);
         }
-        let b = self
-            .client
+        let b = client
             .get_range(&remote_key, abs..abs + len)
             .await?
             .to_vec();

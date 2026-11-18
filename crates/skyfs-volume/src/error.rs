@@ -51,6 +51,17 @@ pub enum VolumeError {
     /// stale and must stop.
     #[error("fenced: another writer took over the volume ({0})")]
     Fenced(String),
+    /// The volume is sealed: it can only be mounted read-only.
+    #[error("volume {0} is sealed: mount it read-only")]
+    Sealed(String),
+    /// A volume used as a base is not sealed, so its objects may change or
+    /// be collected under the volumes that reference it.
+    #[error("volume {0} is not sealed and cannot be a base")]
+    NotSealed(String),
+    /// The volume is mounted or did not end its last mount with everything
+    /// restored into a snapshot, so its latest snapshot is not its state.
+    #[error("volume {0} is not quiescent: {1}")]
+    NotQuiescent(String, String),
 }
 
 impl From<prost::DecodeError> for VolumeError {

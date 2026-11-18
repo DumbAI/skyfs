@@ -124,6 +124,35 @@ pub fn create_volume(
     runtime()?.block_on(mount::create(client, volume_id, opts, scratch))
 }
 
+/// Publishes quiescent volume `src` as the new sealed volume `dst`
+/// ([`crate::published::publish`]).
+pub fn publish_volume(
+    src: &ObjectClient,
+    src_id: [u8; 16],
+    dst: &ObjectClient,
+    dst_id: [u8; 16],
+    keep: &mut crate::published::Keep<'_>,
+    scratch: &std::path::Path,
+) -> Result<crate::Published, VolumeError> {
+    runtime()?.block_on(crate::published::publish(
+        src, src_id, dst, dst_id, keep, scratch,
+    ))
+}
+
+/// Creates volume `dst` as a metadata-only clone of sealed volume `base`
+/// ([`crate::published::clone_volume`]).
+pub fn clone_volume(
+    base: &ObjectClient,
+    base_id: [u8; 16],
+    dst: &ObjectClient,
+    dst_id: [u8; 16],
+    scratch: &std::path::Path,
+) -> Result<crate::Cloned, VolumeError> {
+    runtime()?.block_on(crate::published::clone_volume(
+        base, base_id, dst, dst_id, scratch,
+    ))
+}
+
 impl Volume {
     /// Mounts the volume: snapshot, tail replay, recovery, a new epoch.
     /// Returns once `MountBegin` is committed.

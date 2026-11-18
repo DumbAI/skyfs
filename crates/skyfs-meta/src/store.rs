@@ -19,6 +19,10 @@ pub enum MetaError {
     /// The file is not a skyfs metadata store this build can read.
     #[error("unsupported metadata schema version {0}")]
     SchemaVersion(u32),
+    /// The store is not in the state an operation requires (e.g. a
+    /// snapshot was expected but extents point into log segments).
+    #[error("{0}")]
+    Invalid(String),
 }
 
 /// Applying a record failed. For a record from the log this means the log
@@ -69,7 +73,7 @@ pub struct MetaStore {
 }
 
 const ATTR_COLS: &str = "ino, kind, mode, uid, gid, nlink, size, atime, mtime, ctime, rdev";
-const EXTENT_COLS: &str = "off, len, seg, obj, chunk_off, chunk_len, crc, skip";
+const EXTENT_COLS: &str = "off, len, seg, obj, chunk_off, chunk_len, crc, skip, vol";
 
 impl MetaStore {
     /// Creates an empty store at `path`, replacing nothing: the file must
@@ -103,10 +107,19 @@ impl MetaStore {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         let store = Self { conn };
         let version: u32 = store.meta(key::SCHEMA_VERSION)?.unwrap_or(0);
-        if version != SCHEMA_VERSION {
+        if !schema::READABLE.contains(&version) {
             return Err(MetaError::SchemaVersion(version));
         }
         store.configure()?;
+        if version == 1 {
+            let tx = store.conn.unchecked_transaction()?;
+            tx.execute_batch(schema::MIGRATE_1_TO_2)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)",
+                params![key::SCHEMA_VERSION, SCHEMA_VERSION],
+            )?;
+            tx.commit()?;
+        }
         Ok(store)
     }
 
@@ -322,10 +335,11 @@ impl MetaStore {
         self.extents_where("seg IS NOT NULL ORDER BY seg, chunk_off, skip")
     }
 
-    /// Every extent stored in object `key`.
+    /// Every extent stored in this volume's object `key`.
     pub fn extents_in_object(&self, key: &str) -> Result<Vec<(Ino, Extent)>, MetaError> {
         let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT ino, {EXTENT_COLS} FROM extents WHERE obj = ?1 ORDER BY chunk_off, skip"
+            "SELECT ino, {EXTENT_COLS} FROM extents WHERE obj = ?1 AND vol IS NULL
+             ORDER BY chunk_off, skip"
         ))?;
         let rows = stmt.query_map([key], |r| Ok((r.get(0)?, extent_row(r, 1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -373,25 +387,29 @@ impl MetaStore {
         let tx = self.conn.transaction()?;
         let usage: Vec<(String, u64, u64)> = {
             let mut stmt = tx.prepare(
-                "SELECT p.key, p.size, COALESCE((SELECT SUM(len) FROM extents e WHERE e.obj = p.key), 0)
+                "SELECT p.key, p.size, COALESCE((SELECT SUM(len) FROM extents e
+                     WHERE e.obj = p.key AND e.vol IS NULL), 0)
                  FROM packs p ORDER BY p.key",
             )?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             rows.collect::<Result<_, _>>()?
         };
         tx.execute(
-            "DELETE FROM packs WHERE NOT EXISTS (SELECT 1 FROM extents e WHERE e.obj = packs.key)",
+            "DELETE FROM packs WHERE NOT EXISTS
+             (SELECT 1 FROM extents e WHERE e.obj = packs.key AND e.vol IS NULL)",
             [],
         )?;
         tx.commit()?;
         Ok(usage.into_iter().filter(|u| u.2 > 0).collect())
     }
 
-    /// Every object key extents reference, for GC.
+    /// Every object of this volume that extents reference, for GC and
+    /// publishing. Objects of base volumes are not this volume's to collect
+    /// and are left out.
     pub fn referenced_objects(&self) -> Result<BTreeSet<String>, MetaError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT obj FROM extents WHERE obj IS NOT NULL")?;
+            .prepare("SELECT DISTINCT obj FROM extents WHERE obj IS NOT NULL AND vol IS NULL")?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -566,8 +584,14 @@ impl MetaStore {
         )?;
         check(
             "SELECT ino FROM extents WHERE len = 0 OR skip + len > chunk_len
-             OR (seg IS NULL) = (obj IS NULL)",
+             OR (seg IS NULL) = (obj IS NULL)
+             OR (vol IS NOT NULL AND (seg IS NOT NULL OR length(vol) != 16))",
             "malformed extent",
+        )?;
+        check(
+            "SELECT e.ino FROM extents e WHERE e.vol IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM bases b WHERE b.vol = e.vol)",
+            "extent in a base volume the store does not list",
         )?;
         Ok(problems)
     }
@@ -605,14 +629,25 @@ pub(crate) fn attr_row(r: &Row<'_>) -> rusqlite::Result<Attr> {
 pub(crate) fn extent_row(r: &Row<'_>, base: usize) -> rusqlite::Result<Extent> {
     let seg: Option<u64> = r.get(base + 2)?;
     let obj: Option<String> = r.get(base + 3)?;
-    let loc = match (seg, obj) {
-        (Some(seq), None) => Location::Segment { seq },
-        (None, Some(key)) => Location::Object { key },
+    let vol: Option<Vec<u8>> = r.get(base + 8)?;
+    let loc = match (seg, obj, vol) {
+        (Some(seq), None, None) => Location::Segment { seq },
+        (None, Some(key), None) => Location::Object { key },
+        (None, Some(key), Some(vol)) => Location::External {
+            volume: vol.try_into().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    base + 8,
+                    rusqlite::types::Type::Blob,
+                    "extent vol must be 16 bytes".into(),
+                )
+            })?,
+            key,
+        },
         _ => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 base + 2,
                 rusqlite::types::Type::Null,
-                "extent must have exactly one of seg, obj".into(),
+                "extent must have exactly one of seg, obj (vol only with obj)".into(),
             ));
         }
     };

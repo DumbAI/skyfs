@@ -12,7 +12,13 @@ an immutable write-ahead log in blob storage. Read `docs/design.md` and
   fold it into snapshots; it is truncated only at its old end, never
   rewritten.
 - **One `apply`.** The live writer and replay use the same function in
-  `skyfs-meta`. Local metadata changes only through it.
+  `skyfs-meta`. Local metadata changes only through it. (Publish and clone
+  edit a *copy* of a snapshot into another volume's genesis snapshot,
+  `skyfs-meta::genesis`; no mounted state is involved.)
+- **Base volumes are sealed and read-only.** An `External` extent names an
+  object of a sealed volume (design §13). Nothing writes to a base, and a
+  volume's GC, repacking and pack accounting see only its own objects
+  (`vol IS NULL`).
 - **Validate, then log, then apply.** A failing operation returns an errno
   and is never logged. Applying a logged record cannot fail; a failure is
   corruption and refuses the mount.
