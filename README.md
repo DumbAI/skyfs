@@ -138,7 +138,10 @@ container holds no credentials at all.
 ### In Kubernetes
 
 `Dockerfile` builds the daemon image (`docker build -t skyfs .`): the
-binary, `fuse3`, CA certificates and a shell. As a sidecar that propagates
+binary, `fuse3`, CA certificates and a shell. CI publishes it for amd64 and
+arm64 as `ghcr.io/dumbai/skyfs` (`.github/workflows/image.yml`): `sha-<short
+sha>` for every build of `main` (pin it by digest), `main`, and `X.Y.Z` for a
+`vX.Y.Z` tag. As a sidecar that propagates
 its mount to the app container:
 
 - Run it as a **native sidecar** (an init container with

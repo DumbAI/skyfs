@@ -1,0 +1,111 @@
+# The skyfs container image (Dockerfile), published to ghcr.io/dumbai/skyfs
+# for amd64 and arm64. Each architecture builds on its own native runner (a
+# Rust build under emulation takes far longer), pushes by digest, and one
+# job joins them under the tags:
+#
+#   sha-<short sha>   every build: what consumers pin (by digest)
+#   main              the latest build of main
+#   <version>         a release tag vX.Y.Z → X.Y.Z
+#
+# workflow_dispatch builds any ref, e.g. the rev a consumer pins.
+
+name: image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to build"
+        required: true
+        default: main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/dumbai/skyfs
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+      - name: Keep the digest
+        run: |
+          mkdir -p /tmp/digests
+          d="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${d#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - id: tags
+        name: Tags
+        run: |
+          sha=$(git rev-parse --short=7 HEAD)
+          tags="-t $IMAGE:sha-$sha"
+          case "$GITHUB_REF" in
+            refs/tags/v*) tags="$tags -t $IMAGE:${GITHUB_REF#refs/tags/v}" ;;
+          esac
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            tags="$tags -t $IMAGE:main"
+          fi
+          echo "args=$tags" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: /tmp/digests
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Join the architectures
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create ${{ steps.tags.outputs.args }} \
+            $(printf "$IMAGE@sha256:%s " *)
+      - name: Show the digest to pin
+        run: docker buildx imagetools inspect "$IMAGE:sha-${{ steps.tags.outputs.sha }}"
