@@ -30,8 +30,9 @@ own adapter tests and kernel smoke test on both macOS and Linux.
 | 8 | Filesystem regression | `scripts/xfstests.sh` | Linux, root | xfstests generic `quick` group through `mount -t fuse.skyfs` | 639 run, 12 excluded |
 | 9 | Real bucket | `scripts/s3-e2e.sh` | Linux, root, S3 | latency, throughput, cold reads, fencing and recovery over the network | 6 scenarios |
 
-Layers 1 to 5 and 6b run on every push (`cargo test` in CI, on Linux and
-macOS). Layers 6 to 8 run in CI on Linux, 6c on both Linux and macOS.
+Layers 1 to 5 and 6b run on every push (`cargo test` in CI). Layers 6 to 8
+and 6c run in CI. CI is Linux only; macOS (`cargo test`, 6c as the user) is
+checked by hand.
 Layer 9 needs a bucket and credentials and is run by hand.
 
 The layering follows the crates. Each layer tests one crate through its
@@ -422,8 +423,8 @@ sudo env PATH="$PWD/target/release:$PATH" STORE=s3://bucket/prefix SKYFS_REGION=
 ```
 
 CI (`.github/workflows/ci.yml`) runs five jobs on every push: `rust`
-(fmt, clippy, `cargo test`, on Linux and macOS), `fuse` (smoke), `nfs`
-(NFS smoke on Linux and macOS), `pjdfstest`, and `xfstests`.
+(fmt, clippy, `cargo test`), `fuse` (smoke), `nfs` (NFS smoke),
+`pjdfstest`, and `xfstests`, all on Linux. macOS is not in CI.
 
 **Rules for extending the suites:**
 

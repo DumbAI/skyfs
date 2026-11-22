@@ -9,13 +9,10 @@ permissions:
   contents: read
 
 jobs:
-  # Linux is the production platform; macOS builds the NFS transport and
-  # the macOS-only code paths (local sync).
+  # CI runs on Linux only, the production platform. macOS (the NFS
+  # transport, local sync) is checked locally.
   rust:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.96
@@ -38,25 +35,17 @@ jobs:
       - run: cargo build -p skyfs
       - run: sudo env PATH="$PWD/target/debug:$PATH" scripts/fuse-smoke.sh
 
-  # The NFS transport through each kernel's own NFS client: the same story
-  # as the FUSE smoke test. macOS runs it as the runner's user (no root,
-  # nothing installed); Linux needs root and nfs-common.
+  # The NFS transport through the kernel's NFS client: the same story as
+  # the FUSE smoke test. Needs root and nfs-common.
   nfs:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.96
       - uses: Swatinem/rust-cache@v2
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y nfs-common
+      - run: sudo apt-get update && sudo apt-get install -y nfs-common
       - run: cargo build -p skyfs
-      - if: runner.os == 'Linux'
-        run: sudo env PATH="$PWD/target/debug:$PATH" scripts/nfs-smoke.sh
-      - if: runner.os == 'macOS'
-        run: env PATH="$PWD/target/debug:$PATH" scripts/nfs-smoke.sh
+      - run: sudo env PATH="$PWD/target/debug:$PATH" scripts/nfs-smoke.sh
 
   # POSIX conformance (design §9): the full pjdfstest suite on a skyfs mount.
   pjdfstest:
